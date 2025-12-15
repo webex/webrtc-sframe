@@ -155,440 +155,90 @@ class VideoRtpReceiver : public RtpReceiverInternal {
 };
 ```
 
-## Proposal 2: FrameTransformerNegotiationObserver Pattern (Archived)
+#### Blink
 
-### Motivation
+##### RTCRtpSenderInternal
 
-This archived approach used an **observer/push pattern** where transformers actively request SDP features through a callback interface.
-
-## Proposal 2: FrameTransformerNegotiationObserver Pattern (Archived)
-
-### Motivation
-
-This archived approach used an **observer/push pattern** where transformers actively request SDP features through a callback interface.
-
-With an SFrame feature implemented through transformers, it requires an ability to trigger additional actions at the libWebRTC level for it to work correctly, such as:
-* **SDP Modification**: Add `a=sframe` attribute to the m-line
-* **Packetizer Selection**: Use SFrame-specific packetizer/depacketizer
-
-One approach is to extend `FrameTransformerInterface` with an ability to register an observer with a predefined list of features that can be signaled.
-
-### API Design
-
-#### SdpFeature Enum
-
-Define an enumeration of SDP features that transformers can request:
+Currently:
 
 ```cpp
-enum class SdpFeature {
-  // Secure Frame (SFrame) encryption
-  // Adds "a=sframe" to the SDP
-  kSFrame,
-};
-```
+RTCRtpSenderInternal(
+      webrtc::scoped_refptr<webrtc::PeerConnectionInterface>
+          native_peer_connection,
+      scoped_refptr<blink::WebRtcMediaStreamTrackAdapterMap> track_map,
+      RtpSenderState state)
+      : native_peer_connection_(std::move(native_peer_connection)),
+        track_map_(std::move(track_map)),
+        main_task_runner_(state.main_task_runner()),
+        signaling_task_runner_(state.signaling_task_runner()),
+        webrtc_sender_(state.webrtc_sender()),
+        state_(std::move(state)) {
+    DCHECK(track_map_);
+    DCHECK(state_.is_initialized());
 
-#### FrameTransformerNegotiationObserver Interface
-
-The observer interface that RTP senders/receivers implement to handle negotiation requests:
-
-```cpp
-class FrameTransformerNegotiationObserver {
- public:
-  virtual ~FrameTransformerNegotiationObserver() = default;
-
-  // Called when the transformer wants to enable a predefined SDP feature.
-  // This automatically triggers SDP renegotiation.
-  // Parameters:
-  //   feature - The predefined feature to enable (e.g., SdpFeature::kSFrame)
-  virtual void OnSdpAttributeRequest(SdpFeature feature) = 0;
-};
-```
-
-#### FrameTransformerInterface Extension
-
-Extend `FrameTransformerInterface` to support observer registration:
-
-```cpp
-class FrameTransformerInterface : public RefCountInterface {
- public:
-  // Register an observer to receive negotiation requests
-  virtual void SetNegotiationObserver(
-      FrameTransformerNegotiationObserver* observer) {}
-
-  // Unregister the current observer
-  virtual void UnsetNegotiationObserver() {}
-
- protected:
-  ~FrameTransformerInterface() override = default;
-};
-```
-
-### Implementation in SFrame Transformers
-
-#### SFrameTransformerBase
-
-The base class implements observer registration and triggers negotiation when needed:
-
-```cpp
-class SFrameTransformerBase : public SFrameTransformerInterface {
- public:
-  SFrameTransformerBase();
-
-  // SFrameTransformerInterface implementation
-  void SetEncryptionKey(const std::vector<uint8_t>& key) override;
-  std::vector<uint8_t> GetEncryptionKey() const override;
-
-  // FrameTransformerInterface implementation
-  void SetNegotiationObserver(
-      FrameTransformerNegotiationObserver* observer) override;
-  void UnsetNegotiationObserver() override;
-
- protected:
-  void RequestSdpFeature(SdpFeature feature);
-
- private:
-  FrameTransformerNegotiationObserver* negotiation_observer_ = nullptr;
-};
-```
-
-Implementation:
-
-```cpp
-void SFrameTransformerBase::SetNegotiationObserver(
-    FrameTransformerNegotiationObserver* observer) {
-  negotiation_observer_ = observer;
-  
-  // Immediately request SFrame SDP attribute when observer is set
-  if (negotiation_observer_) {
-    RequestSdpFeature(SdpFeature::kSFrame);
+    if (webrtc_sender_->media_type() == webrtc::MediaType::AUDIO) {
+      // Frame-level transformer
+      encoded_audio_transformer_ =
+          std::make_unique<RTCEncodedAudioStreamTransformer>(main_task_runner_);
+      webrtc_sender_->SetFrameTransformer(
+          encoded_audio_transformer_->Delegate());
+      
+      // Packet-level transformer
+      encoded_audio_packet_transformer_ =
+          std::make_unique<RTCEncodedAudioStreamTransformer>(main_task_runner_);
+      webrtc_sender_->SetPacketTransformer(
+          encoded_audio_packet_transformer_->Delegate(), {});
+    } else {
+      CHECK(webrtc_sender_->media_type() == webrtc::MediaType::VIDEO);
+      // Frame-level transformer
+      encoded_video_transformer_ =
+          std::make_unique<RTCEncodedVideoStreamTransformer>(
+              main_task_runner_, /*metronome=*/nullptr);
+      webrtc_sender_->SetFrameTransformer(
+          encoded_video_transformer_->Delegate());
+      
+      // Packet-level transformer
+      encoded_video_packet_transformer_ =
+          std::make_unique<RTCEncodedVideoStreamTransformer>(
+              main_task_runner_, /*metronome=*/nullptr);
+      webrtc_sender_->SetPacketTransformer(
+          encoded_video_packet_transformer_->Delegate(), {});
+    }
   }
-}
+```
 
-void SFrameTransformerBase::UnsetNegotiationObserver() {
-  negotiation_observer_ = nullptr;
-}
+With new recreate method:
 
-void SFrameTransformerBase::RequestSdpFeature(SdpFeature feature) {
-  if (negotiation_observer_) {
-    negotiation_observer_->OnSdpAttributeRequest(feature);
+```cpp
+void RTCRtpSenderInternal::MaybeRecreateFrameTransformers() {
+  if (encoded_video_transformer_) {
+    // Recreate frame transformer
+    auto features = encoded_video_transformer_->GetTransformationFeatures();
+
+    webrtc_sender_->SetFrameTransformer(
+      encoded_video_transformer_->Delegate(), features);
+  }
+    
+  // Recreate packet transformer
+  if (encoded_video_packet_transformer_) {
+    auto features = encoded_video_packet_transformer_->GetTransformationFeatures();
+
+    webrtc_sender_->SetPacketTransformer(
+      encoded_video_packet_transformer_->Delegate(), features);
   }
 }
 ```
 
-## Integration with RTP Senders
-
-### RtpSenderBase Implementation
-
-`RtpSenderBase` implements `FrameTransformerNegotiationObserver` to handle negotiation requests from transformers:
+##### RTCRtpSender
 
 ```cpp
-class RtpSenderBase : public RtpSenderInternal,
-                      public FrameTransformerHost,
-                      public FrameTransformerNegotiationObserver {
- public:
-  // FrameTransformerHost implementation
-  void SetFrameTransformer(
-      scoped_refptr<FrameTransformerInterface> frame_transformer) override;
+void RTCRtpSender::setTransform(
+    V8UnionRTCRtpScriptTransformOrSFrameTransform* transform,
+    ExceptionState& exception_state) {
+  /// Perform creation of transformers
 
-  void SetPacketTransformer(
-      scoped_refptr<FrameTransformerInterface> packet_transformer) override;
-
-  // FrameTransformerNegotiationObserver implementation
-  void OnSdpAttributeRequest(SdpFeature feature) override;
-
- private:
-  // Stored transformer references
-  scoped_refptr<FrameTransformerInterface> frame_transformer_;
-  scoped_refptr<FrameTransformerInterface> packet_transformer_;
-  
-  // Requested SDP features from transformers
-  std::vector<SdpFeature> transformer_sdp_features_;
-  
-  // Callback to trigger SDP renegotiation
-  OnNegotiationNeededCallback on_negotiation_needed_;
-};
-```
-
-### Transformer Registration and Negotiation
-
-```cpp
-void RtpSenderBase::SetFrameTransformer(
-    scoped_refptr<FrameTransformerInterface> frame_transformer) {
-  // Unregister from old transformer if present
-  if (frame_transformer_) {
-    frame_transformer_->UnsetNegotiationObserver();
-  }
-
-  frame_transformer_ = std::move(frame_transformer);
-
-  // Register as negotiation observer
-  if (frame_transformer_) {
-    frame_transformer_->SetNegotiationObserver(this);
-  }
-
-  if (media_channel_ && ssrc_ && !stopped_) {
-    worker_thread_->BlockingCall([&] {
-      media_channel_->SetEncoderToPacketizerFrameTransformer(
-          ssrc_, frame_transformer_);
-    });
+  if (sender_) {
+    sender_->MaybeRecreateFrameTransformers();
   }
 }
-
-void RtpSenderBase::SetPacketTransformer(
-    scoped_refptr<FrameTransformerInterface> packet_transformer) {
-  // Unregister from old transformer if present
-  if (packet_transformer_) {
-    packet_transformer_->UnsetNegotiationObserver();
-  }
-
-  packet_transformer_ = std::move(packet_transformer);
-
-  // Register as negotiation observer
-  if (packet_transformer_) {
-    packet_transformer_->SetNegotiationObserver(this);
-  }
-
-  if (media_channel_ && ssrc_ != 0) {
-    worker_thread_->BlockingCall([&] {
-      media_channel_->SetPacketTransformer(ssrc_, packet_transformer_);
-    });
-  }
-}
-
-void RtpSenderBase::OnSdpAttributeRequest(SdpFeature feature) {
-  transformer_sdp_features_.push_back(feature);
-  
-  // Trigger SDP renegotiation
-  if (on_negotiation_needed_) {
-    on_negotiation_needed_();
-  }
-}
-```
-
-### Sequence Diagram: Frame-Level Transformer with Negotiation
-
-```mermaid
-sequenceDiagram
-    participant User as Application/User Code
-    participant API as RtpSenderInterface
-    participant Base as RtpSenderBase
-    participant Transformer as SFrameFrameTransformer
-    participant Delegate as RtpSenderVideoFrameTransformerDelegate
-
-    Note over User, Delegate: Frame-Level SFrame Transformer with Negotiation
-
-    User->>User: Create SFrame Frame Transformer
-    Note right of User: auto transformer =<br/>make_ref_counted<SFrameFrameTransformer>()
-
-    User->>Transformer: SetEncryptionKey(key)
-    
-    User->>API: SetFrameTransformer(transformer)
-    API->>Base: SetFrameTransformer(transformer)
-    
-    Base->>Transformer: SetNegotiationObserver(this)
-    Note over Base, Transformer: Register for SDP negotiations
-    
-    Transformer->>Base: OnSdpAttributeRequest(SdpFeature::kSFrame)
-    Note over Transformer, Base: Request SFrame SDP attribute
-    
-    Base->>Base: on_negotiation_needed_callback_()
-    Note over Base: Trigger SDP renegotiation
-    
-    Base->>Delegate: Create RtpSenderVideoFrameTransformerDelegate
-    Note over Base, Delegate: Delegate manages frame transformation
-
-    Note over User, Delegate: Initialization Complete with Negotiation
-```
-
-### Sequence Diagram: Packet-Level Transformer with Negotiation
-
-```mermaid
-sequenceDiagram
-    participant User as Application/User Code
-    participant API as RtpSenderInterface
-    participant Base as RtpSenderBase
-    participant Transformer as SFramePacketTransformer
-    participant Delegate as RtpSenderVideoPacketTransformerDelegate
-
-    Note over User, Delegate: Packet-Level SFrame Transformer with Negotiation
-
-    User->>User: Create SFrame Packet Transformer
-    Note right of User: auto transformer =<br/>make_ref_counted<SFramePacketTransformer>()
-
-    User->>Transformer: SetEncryptionKey(key)
-    
-    User->>API: SetPacketTransformer(transformer)
-    API->>Base: SetPacketTransformer(transformer)
-    
-    Base->>Transformer: SetNegotiationObserver(this)
-    Note over Base, Transformer: Register for SDP negotiations
-    
-    Transformer->>Base: OnSdpAttributeRequest(SdpFeature::kSFrame)
-    Note over Transformer, Base: Request SFrame SDP attribute
-    
-    Base->>Base: on_negotiation_needed_callback_()
-    Note over Base: Trigger SDP renegotiation
-    
-    Base->>Delegate: Create RtpSenderVideoPacketTransformerDelegate
-    Note over Base, Delegate: Delegate manages packet transformation
-
-    Note over User, Delegate: Initialization Complete with Negotiation
-```
-
-## Integration with RTP Receivers
-
-### VideoRtpReceiver Implementation
-
-`VideoRtpReceiver` implements `FrameTransformerNegotiationObserver` to handle negotiation requests from transformers:
-
-```cpp
-class VideoRtpReceiver : public RtpReceiverInternal,
-                         public FrameTransformerNegotiationObserver {
- public:
-  void SetFrameTransformer(
-      scoped_refptr<FrameTransformerInterface> frame_transformer) override;
-
-  void SetPacketTransformer(
-      scoped_refptr<FrameTransformerInterface> packet_transformer) override;
-
-  // FrameTransformerNegotiationObserver implementation
-  void OnSdpAttributeRequest(SdpFeature feature) override;
-
- private:
-  // Stored transformer references
-  scoped_refptr<FrameTransformerInterface> frame_transformer_
-      RTC_GUARDED_BY(worker_thread_);
-  scoped_refptr<FrameTransformerInterface> packet_transformer_
-      RTC_GUARDED_BY(worker_thread_);
-
-  // Callback to trigger SDP renegotiation
-  OnNegotiationNeededCallback on_negotiation_needed_;
-};
-```
-
-### Transformer Registration and Negotiation
-
-```cpp
-void VideoRtpReceiver::SetFrameTransformer(
-    scoped_refptr<FrameTransformerInterface> frame_transformer) {
-  RTC_DCHECK_RUN_ON(worker_thread_);
-  
-  // Unregister from old transformer
-  if (frame_transformer_) {
-    frame_transformer_->UnsetNegotiationObserver();
-  }
-  
-  frame_transformer_ = std::move(frame_transformer);
-  
-  // Register with new transformer
-  if (frame_transformer_) {
-    frame_transformer_->SetNegotiationObserver(this);
-  }
-
-  if (media_channel_) {
-    media_channel_->SetDepacketizerToDecoderFrameTransformer(
-        signaled_ssrc_.value_or(0), frame_transformer_);
-  }
-}
-
-void VideoRtpReceiver::SetPacketTransformer(
-    scoped_refptr<FrameTransformerInterface> packet_transformer) {
-  RTC_DCHECK_RUN_ON(worker_thread_);
-  
-  // Unregister from old transformer
-  if (packet_transformer_) {
-    packet_transformer_->UnsetNegotiationObserver();
-  }
-  
-  packet_transformer_ = std::move(packet_transformer);
-  
-  // Register with new transformer
-  if (packet_transformer_) {
-    packet_transformer_->SetNegotiationObserver(this);
-  }
-
-  if (media_channel_) {
-    media_channel_->SetPacketTransformer(signaled_ssrc_.value_or(0),
-                                         packet_transformer_);
-  }
-}
-
-void VideoRtpReceiver::OnSdpAttributeRequest(SdpFeature feature) {
-  RTC_DCHECK_RUN_ON(worker_thread_);
-  
-  // Trigger SDP renegotiation
-  if (on_negotiation_needed_) {
-    on_negotiation_needed_();
-  }
-}
-```
-
-### Sequence Diagram: Frame-Level Transformer with Negotiation
-
-```mermaid
-sequenceDiagram
-    participant User as Application/User Code
-    participant API as RtpReceiverInterface
-    participant Base as VideoRtpReceiver
-    participant Transformer as SFrameFrameTransformer
-    participant Delegate as RtpVideoStreamReceiverFrameTransformerDelegate
-
-    Note over User, Delegate: Frame-Level SFrame Transformer with Negotiation
-
-    User->>User: Create SFrame Frame Transformer
-    Note right of User: auto transformer =<br/>make_ref_counted<SFrameFrameTransformer>()
-
-    User->>Transformer: SetDecryptionKey(key)
-    
-    User->>API: SetDepacketizerToDecoderFrameTransformer(transformer)
-    API->>Base: SetDepacketizerToDecoderFrameTransformer(transformer)
-    
-    Base->>Transformer: SetNegotiationObserver(this)
-    Note over Base, Transformer: Register for SDP negotiations
-    
-    Transformer->>Base: OnSdpAttributeRequest(SdpFeature::kSFrame)
-    Note over Transformer, Base: Request SFrame SDP attribute
-    
-    Base->>Base: on_negotiation_needed_callback_()
-    Note over Base: Trigger SDP renegotiation
-    
-    Base->>Delegate: Create RtpVideoStreamReceiverFrameTransformerDelegate
-    Note over Base, Delegate: Delegate manages frame transformation
-
-    Note over User, Delegate: Initialization Complete with Negotiation
-```
-
-### Sequence Diagram: Packet-Level Transformer with Negotiation
-
-```mermaid
-sequenceDiagram
-    participant User as Application/User Code
-    participant API as RtpReceiverInterface
-    participant Base as VideoRtpReceiver
-    participant Transformer as SFramePacketTransformer
-    participant Delegate as RtpVideoStreamReceiverPacketTransformerDelegate
-
-    Note over User, Delegate: Packet-Level SFrame Transformer with Negotiation
-
-    User->>User: Create SFrame Packet Transformer
-    Note right of User: auto transformer =<br/>make_ref_counted<SFramePacketTransformer>()
-
-    User->>Transformer: SetDecryptionKey(key)
-    
-    User->>API: SetPacketTransformer(transformer)
-    API->>Base: SetPacketTransformer(transformer)
-    
-    Base->>Transformer: SetNegotiationObserver(this)
-    Note over Base, Transformer: Register for SDP negotiations
-    
-    Transformer->>Base: OnSdpAttributeRequest(SdpFeature::kSFrame)
-    Note over Transformer, Base: Request SFrame SDP attribute
-    
-    Base->>Base: on_negotiation_needed_callback_()
-    Note over Base: Trigger SDP renegotiation
-    
-    Base->>Delegate: Create RtpVideoStreamReceiverPacketTransformerDelegate
-    Note over Base, Delegate: Delegate manages packet transformation
-
-    Note over User, Delegate: Initialization Complete with Negotiation
 ```
