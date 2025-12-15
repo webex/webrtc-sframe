@@ -40,10 +40,10 @@ RTP interfaces inherit from `FrameTransformerHost` to support SFrame injection:
 class RtpSenderInterface : public FrameTransformerHost {
  public:
   void SetFrameTransformer(
-      scoped_refptr<SFrameTransformerInterface> frame_transformer) {};
+      scoped_refptr<FrameTransformerInterface> frame_transformer) {};
 
   void SetPacketTransformer(
-      scoped_refptr<SFrameTransformerInterface> packet_transformer) {};
+      scoped_refptr<FrameTransformerInterface> packet_transformer) {};
 };
 ```
 
@@ -52,9 +52,9 @@ class RtpSenderInterface : public FrameTransformerHost {
 class RtpReceiverInterface : public FrameTransformerHost {
  public:
   void SetFrameTransformer(
-      scoped_refptr<SFrameTransformerInterface> frame_transformer) {};
+      scoped_refptr<FrameTransformerInterface> frame_transformer) {};
 
   void SetPacketTransformer(
-      scoped_refptr<SFrameTransformerInterface> packet_transformer) {};
+      scoped_refptr<FrameTransformerInterface> packet_transformer) {};
 };
 ```
