@@ -99,17 +99,17 @@ class RtpSenderBase : public RtpSenderInternal {
     frame_transformer_ = std::move(frame_transformer);
     frame_transformer_features_ = features;
     
-    // Trigger negotiation if features changed
-    if (features_changed && on_negotiation_needed_) {
-      on_negotiation_needed_();
-    }
-    
     // Set transformer on worker thread
     if (media_channel_ && ssrc_ && !stopped_) {
       worker_thread_->BlockingCall([&] {
         media_channel_->SetEncoderToPacketizerFrameTransformer(
             ssrc_, frame_transformer_);
       });
+    }
+
+    // Trigger negotiation if features changed
+    if (features_changed && on_negotiation_needed_) {
+      on_negotiation_needed_();
     }
   }
 
@@ -145,72 +145,14 @@ class VideoRtpReceiver : public RtpReceiverInternal {
             signaled_ssrc_.value_or(0), frame_transformer_);
       }
     });
+
+    // On neegotiation needed trigger
   }
 
  private:
   std::vector<SdpFeature> frame_transformer_features_
       RTC_GUARDED_BY(signaling_thread_checker_);
 };
-```
-
-### Usage Example
-
-```cpp
-// Create SFrame transformer
-auto sframe_transformer = CreateSFrameTransformer();
-
-// Attach to sender with SFrame feature
-sender->SetPacketTransformer(sframe_transformer, {SdpFeature::kSFrame});
-
-// This triggers negotiation needed event, which causes:
-// 1. PeerConnection to call CreateOffer/CreateAnswer
-// 2. SDP generation to check transformer features
-// 3. Add "a=sframe" attribute to m-line if kSFrame feature present
-```
-
-### Advantages
-
-1. **Explicit Control**: Application has full visibility and control over which features are enabled
-2. **Simple Transformer Implementation**: Transformers don't need to know about negotiation
-3. **Testable**: Easy to test feature changes and negotiation triggers
-4. **Flexible**: Can attach transformers without features, or change features later
-5. **Thread-Safe**: Clear ownership - features stored on signaling thread, transformers on worker thread
-
-### Disadvantages
-
-1. **Application Responsibility**: Application must know which features to request
-2. **Timing**: Application must coordinate transformer attachment with feature specification
-3. **No Dynamic Discovery**: Transformers can't dynamically request features based on runtime state
-
-### Integration Points
-
-#### SDP Offer/Answer Generation
-
-When generating SDP, check sender/receiver features:
-
-```cpp
-// In MediaSessionDescriptionFactory
-for (auto& sender : transceivers->senders()) {
-  const auto& features = sender->GetTransformerFeatures();
-  
-  if (std::find(features.begin(), features.end(), 
-                SdpFeature::kSFrame) != features.end()) {
-    // Add a=sframe attribute to media description
-    media_desc->AddAttribute("sframe", "");
-  }
-}
-```
-
-#### Proxy Support
-
-Proxy classes updated to handle features parameter:
-
-```cpp
-// In rtp_sender_proxy.h
-PROXY_METHOD2(void,
-              SetFrameTransformer,
-              scoped_refptr<FrameTransformerInterface>,
-              const std::vector<SdpFeature>&)
 ```
 
 ## Proposal 2: FrameTransformerNegotiationObserver Pattern (Archived)
@@ -650,26 +592,3 @@ sequenceDiagram
 
     Note over User, Delegate: Initialization Complete with Negotiation
 ```
-
-## Design Rationale
-
-This design is primarily driven by how Chromium's `blink` level leverages the `Encoded Transform` API. The observer pattern allows:
-
-1. **Decoupling**: Transformers don't need direct access to SDP generation logic
-2. **Flexibility**: New SDP features can be added to the enum without changing transformer implementations
-3. **Automatic Triggering**: Negotiation is triggered immediately when transformers are attached
-4. **Clear Ownership**: RTP senders/receivers own the negotiation lifecycle
-
-## Alternative Approaches
-
-Other approaches to consider:
-
-1. **Direct SDP Modification**: Transformers directly modify MediaDescriptionOptions (see main implementation)
-2. **Configuration Object**: Pass configuration during transformer creation instead of runtime negotiation
-3. **Separate Negotiation API**: Decouple SDP feature requests from transformer lifecycle
-
-## Status
-
-This approach is documented for reference but is **not currently implemented** in the main codebase. The current implementation uses a different pattern where transformers directly modify SDP options during offer/answer creation.
-
-See the main architecture documentation for the currently implemented approach.
