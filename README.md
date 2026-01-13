@@ -10,265 +10,243 @@ SFrame encryption can be applied at two different levels:
 
 Both approaches offer strong security guarantees, with per-packet providing finer granularity and per-frame offering better performance characteristics.
 
-## JavaScript API
-
-### SFrame Modes
-
-```javascript
-// Available modes for SFrame encryption
-const SFrameMode = {
-    "per-frame",   // Encrypt at frame level
-    "per-packet"   // Encrypt at packet level
-};
-```
-
-### Basic Usage
-
-Assumption; JS API usage after recent W3C meeting.
-
-```javascript
-// Create peer connection
-const peerConnection = new RTCPeerConnection();
-
-// Add video track
-const videoTransceiver = peerConnection.addTransceiver("video", {
-  direction: "sendonly"
-});
-
-// Configure SFrame options
-const sframeOptions = {
-  mode: "per-packet"  // or "per-frame"
-};
-
-// Apply SFrame transform
-videoTransceiver.sender.transform = new SFrameTransform(sframeOptions);
-```
-
-### Key Points
-
-- SFrame can be configured independently for each media track
-- Both sender and receiver need compatible SFrame configurations
-- The API maintains backward compatibility with non-SFrame endpoints
-
 ## C++ API
 
 The SFrame API design provides transformer injection at the sender and receiver level, following the JavaScript API pattern:
 
-```javascript
-videoTransceiver.sender.transform = new SFrameTransform(sframeOptions);
-```
-
-Following this design proposal principles, the `SetSFrameTransformer` method will be exposed through the `RTPSenderInterface` and `RTPReceiverInterface` to provide this granular control and maintain consistency with the JavaScript API surface.
-
 ### Core Interfaces
 
-#### SFrameMode Enumeration
+#### RtpTransceiverInterface
 
-Defines the granularity at which SFrame encryption is applied to media data.
+Extend `RtpTransceiverInterface` to give possibility to the caller to enable `SFrame` support for this `Transceiver`.
 
-`api/sframe/sframe_options.h`
+Setting `SFrame` should trigger neegotiation needed event.
+
+`api/rtp_transceiver_interface.h`
 ```cpp
-enum SFrameMode {
-  kPerFrame,   // Frame-level encryption
-  kPerPacket   // Packet-level encryption
-};
-```
-
-#### SFrameOptions Configuration
-
-Configuration structure that defines SFrame encryption behavior.
-
-`api/sframe/sframe_options.h`
-```cpp
-struct SFrameOptions {
-    SFrameMode mode;
-    // Additional options can be added here in the future
-};
-```
-
-#### SFrameTransformerHost Interface
-
-The `SFrameTransformerHost` interface provides a unified way to inject SFrame transformers into WebRTC components. This interface will be implemented by RTP senders and receivers to enable SFrame encryption and decryption capabilities.
-
-`api/sframe/sframe_transformer_interface.h`
-```cpp
-class SFrameTransformerHost {
+class RTC_EXPORT RtpTransceiverInterface : public RefCountInterface {
  public:
-  virtual ~SFrameTransformerHost() = default;
 
-  // Configures SFrame transformer with specified options
-  virtual void SetSFrameTransformer(
-      scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-      SFrameOptions options) = 0;
+  /* Existing fields */
 
-  // Retrieves currently configured transformer (may return nullptr)
-  virtual scoped_refptr<SFrameTransformerInterface> GetSFrameTransformer() = 0;
+  virtual void SetUseSFrame(bool use_sframe) = 0;
+
+  virtual bool UseSFrame() const = 0;
+}
+```
+
+#### SFrameTransformOptions Configuration
+
+Defines which cipher suite SFrame transform will use.
+
+`api/sframe/sframe_transform_options.h`
+```cpp
+enum class SFrameCipherSuite {
+  kAES_128_CTR_HMAC_SHA256_80,
+  kAES_128_CTR_HMAC_SHA256_64,
+  kAES_128_CTR_HMAC_SHA256_32,
+  kAES_128_GCM_SHA256_128,
+  kAES_256_GCM_SHA512_128
 };
 ```
 
-#### SFrame Transformer Interface
+Configuration structure that defines SFrame transform behavior.
 
-The main interface for implementing SFrame encryption/decryption:
-
-`api/sframe/sframe_transformer_interface.h`
+`api/sframe/sframe_transform_options.h`
 ```cpp
-class SFrameTransformerInterface : public RefCountInterface {
+struct SFrameTransformOptions {
+  SFrameCipherSuite cipher_suite = SFrameCipherSuite::kAes128GcmSha256;
+};
+```
+
+#### FrameTransformer Interfaces
+
+##### FrameTransformerInterface Interface
+
+`FrameTransformerInterface` will remain the same as no changes are needed.
+
+`api/frame_transformer_interface.h`
+```cpp
+class FrameTransformerInterface : public RefCountInterface {
  public:
-  virtual ~SFrameTransformerInterface() = default;
+  // Transforms `frame` using the implementing class' processing logic.
+  virtual void Transform(
+      std::unique_ptr<TransformableFrameInterface> transformable_frame) = 0;
 
-  // Configure encryption keys
-  virtual void SetEncryptionKey(/*Keys*/) = 0;
+  virtual void RegisterTransformedFrameCallback(
+      scoped_refptr<TransformedFrameCallback>) {}
+  virtual void RegisterTransformedFrameSinkCallback(
+      scoped_refptr<TransformedFrameCallback>,
+      uint32_t /* ssrc */) {}
+  virtual void UnregisterTransformedFrameCallback() {}
+  virtual void UnregisterTransformedFrameSinkCallback(uint32_t /* ssrc */) {}
 
-  // Transform media data (encrypt or decrypt)
-  virtual void Transform(CopyOnWriteBuffer buffer) = 0;
+ protected:
+  ~FrameTransformerInterface() override = default;
+};
+```
+
+#### FrameTransformerHost Interface
+
+`FrameTransformerHost` will remain the same as no changes are needed.
+
+`api/frame_transformer_interface.h`
+```cpp
+class FrameTransformerHost {
+ public:
+  virtual ~FrameTransformerHost() = default;
+
+  // Sets frame-level transformer
+  virtual void SetFrameTransformer(
+      scoped_refptr<FrameTransformerInterface> frame_transformer) = 0;
 };
 ```
 
 #### Integration with RTP Senders/Receivers
 
-RTP interfaces inherit from `SFrameTransformerHost` to support SFrame injection:
+RTP interfaces inherit from `FrameTransformerHost` to support transformer injection:
 
 `api/rtp_sender_interface.h`
 ```cpp
-class RtpSenderInterface : public SFrameTransformerHost {
+class RtpSenderInterface : public RefCountInterface,
+                           public FrameTransformerHost {
  public:
-  // Default implementation, actuall implementation will be done by classes inheriting RtpSenderInterface
-  void SetSFrameTransformer(
-      scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-      SFrameOptions options) {};
+  void SetFrameTransformer(
+      scoped_refptr<FrameTransformerInterface> frame_transformer) override {}
 };
 ```
 
 `api/rtp_receiver_interface.h`
 ```cpp
-class RtpReceiverInterface : public SFrameTransformerHost {
+class RtpReceiverInterface : public RefCountInterface,
+                             public FrameTransformerHost {
  public:
- // Default implementation, actuall implementation will be done by classes inheriting RtpReceiverInterface
-  void SetSFrameTransformer(
-      scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-      SFrameOptions options) {};
+  void SetFrameTransformer(
+      scoped_refptr<FrameTransformerInterface> frame_transformer) override {}
 };
 ```
 
-### Cisco SFrame Library
+#### SFrame Key Management Interfaces
 
-WebRTC will provide a built-in SFrame implementation using the [Cisco SFrame](https://github.com/cisco/sframe) library.
+Specialized interfaces for encryption and decryption key management:
 
-#### Encrypt or decrypt
-
-Decision whether SFrameTransformer should perform encryption or decryption will be defined by the `SFrameRole` parameter.
-
-`api/sframe/sframe_transformer.h`
+`api/sframe/sframe_key_management.h`
 ```cpp
-enum SFrameRole {
-  Encrypt,
-  Decrypt
-};
-```
-
-#### Supported Cipher Suites
-
-`api/sframe/sframe_transformer.h`
-```cpp
-enum SFrameCipherSuite {
-  AES_128_CTR_HMAC_SHA256_8,   // AES-128-CTR with 8-byte auth tag
-  AES_128_CTR_HMAC_SHA256_64,  // AES-128-CTR with 64-byte auth tag
-  AES_128_CTR_HMAC_SHA256_32,  // AES-128-CTR with 32-byte auth tag
-  AES_128_GCM_SHA256_128,      // AES-128-GCM with 128-bit auth tag
-  AES_256_GCM_SHA512_128       // AES-256-GCM with 128-bit auth tag
-};
-```
-
-#### RTCSFrameTransformer
-
-`RTCSFrameTransformer` will leverage [Cisco SFrame](https://github.com/cisco/sframe) library to implement SFrame encryption/decryption.
-
-`modules/sframe/rtc_sframe_transformer.h`
-```cpp
-class RTCSFrameTransformer : public SFrameTransformerInterface {
+// Interface for encryption key management
+class SFrameEncrypterManager {
  public:
-  explicit RTCSFrameTransformer(SFrameRole role, SFrameCipherSuite cipher_suite);
+  virtual ~SFrameEncrypterManager() = default;
+  
+  virtual bool SetEncryptionKey(const std::string& key,
+                                CryptoKeyID key_id) = 0;
+};
 
-  void SetEncryptionKey(std::string key) override {
-    // Update keys in SFrame Context
-  }
-
-  // Transform media data (encrypt or decrypt)
-  void Transform(CopyOnWriteBuffer buffer) override {
-    // role == SFrameRole::Encrypt ? Encrypt(buffer) : Decrypt(buffer);
-  }
-
-private:
-  void Encrypt(CopyOnWriteBuffer buffer);
-
-  void Decrypt(CopyOnWriteBuffer buffer);
+// Interface for decryption key management
+class SFrameDecrypterManager {
+ public:
+  virtual ~SFrameDecrypterManager() = default;
+  
+  virtual bool AddDecryptionKey(const std::string& key,
+                                CryptoKeyID key_id) = 0;
+  
+  virtual bool RemoveDecryptionKey(CryptoKeyID key_id) = 0;
 };
 ```
 
-#### RTCSFrameTransformer Factory
+#### SFrameEncrypterInterface
 
-`RTCSFrameTransformer` creation will be possible throught the factory method exposed from the libwebrtc API.
+`SFrameEncrypterInterface` will extend  `FrameTransformerInterface` to give `Transformer` ability to handle key changing for encryption.
 
-`api/sframe/sframe_transformer_factory.h`
 ```cpp
-scoped_refptr<SFrameTransformerInterface> CreateSFrameTransformer(SFrameRole role, SFrameCipherSuite cipher_suite);
+class SFrameEncrypterInterface : public FrameTransformerInterface {
+ public:
+  virtual ~SFrameEncrypterInterface() = default;
+
+  virtual void SetEncryptionKey(const std::string& key, CryptoKeyID key_id) = 0;
+};
 ```
 
+#### SFrameDecrypterInterface
+
+`SFrameDecrypterInterface` will extend  `FrameTransformerInterface` to give `Transformer` ability to handle key changing for decryption.
+
 ```cpp
-scoped_refptr<SFrameTransformerInterface> CreateSFrameTransformer(SFrameRole role, SFrameCipherSuite cipher_suite)
-{
-  return make_ref_counted<RTCSFrameTransformer>(role, cipher_suite);
+class SFrameDecrypterInterface : public FrameTransformerInterface {
+ public:
+  virtual ~SFrameDecrypterInterface() = default;
+
+  virtual void AddDecryptionKey(const std::string& key, CryptoKeyID key_id) = 0;
+
+  virtual void RemoveDecryptionKey(CryptoKeyID key_id) = 0;
+};
+```
+
+#### SFrameSenderTransformFactory
+
+`Factory` methods will pick up following arguments:
+* `SFrameTransformOptions` - as described above, options defining how encryption should work.
+* `RtpSenderInterface` - sender to which sframe should be applied.
+* `Thread` - worker thread to which performing tasks should be delegated.
+
+`api/sframe/sframe_transform_factory.h`
+```cpp
+namespace webrtc {
+
+// Factory method to create SFrame sender transform (encryption).
+std::unique_ptr<SFrameEncrypterManager> CreateSFrameSenderTransform(
+    const SFrameTransformOptions& options,
+    scoped_refptr<RtpSenderInterface> sender,
+    Thread* worker_thread = nullptr);
+
+// Factory method to create SFrame receiver transform (decryption).
+std::unique_ptr<SFrameDecrypterManager> CreateSFrameReceiverTransform(
+    const SFrameTransformOptions& options,
+    scoped_refptr<RtpReceiverInterface> receiver,
+    Thread* worker_thread = nullptr);
+
+}  // namespace webrtc
+```
+
+`api/sframe/sframe_transform_factory.cc`
+```cpp
+namespace webrtc {
+
+std::unique_ptr<SFrameEncrypterManager> CreateSFrameSenderTransform(
+    const SFrameTransformOptions& options,
+    FrameTransformerHost* host,
+    Thread* worker_thread) {
+  return std::make_unique<SFrameSenderTransform>(options, host, worker_thread);
 }
+
+std::unique_ptr<SFrameDecrypterManager> CreateSFrameReceiverTransform(
+    const SFrameTransformOptions& options,
+    FrameTransformerHost* host,
+    Thread* worker_thread) {
+  return std::make_unique<SFrameReceiverTransform>(options, host, worker_thread);
+}
+
+}  // namespace webrtc
 ```
 
-### Complete Usage Example
+#### SFrameSenderTransformer
+
+### Initialization flow
+
+User of the `C++` api to enable SFrame would need to take following steps assuming that we already have created `Peer Connection` and a `Transceiver`.
+1. Call a `SetUseSFrame` on the `Transceiver.
+1. Call a `CreateSFrameSenderTransform` on the `Sender` associated with the `Transceiver`
+1. Call a `CreateSFrameReceiverTransform` on the `Receiver` associated with the `Transceiver`
 
 ```cpp
-// Create peer connection
-RTCPeerConnection pc;
+PeerConnection pc{};
 
-// Add video transceiver
-auto transceiver = pc.AddTransceiver("video");
+auto transceiver = pc.addTransceiver('video');
 
-// Create SFrame transformer for encryption
-auto sframe_transformer = CreateSFrameTransformer(SFrameRole::kEncrypt, 
-    SFrameCipherSuite::AES_128_GCM_SHA256_128);
+transceiver.SetUseSFrame(true);
 
-// Configure for per-packet encryption
-SFrameOptions options;
-options.mode = SFrameMode::kPerPacket;
+SFrameTransformOptions options{};
 
-// Apply to sender
-transceiver->sender()->SetSFrameTransformer(sframe_transformer, options);
-
-sframe_transformer->SetEncryptionKey("XYZ");
-```
-
-## Additional Resources
-
-### Related Specifications
-- [SFrame Protocol](https://datatracker.ietf.org/doc/draft-omara-sframe/) - The underlying SFrame specification
-- [WebRTC API](https://w3c.github.io/webrtc-pc/) - W3C WebRTC specification
-- [Cisco SFrame Library](https://github.com/cisco/sframe) - Reference implementation
-- [RTP SFrame](https://datatracker.ietf.org/doc/draft-ietf-avtcore-rtp-sframe)
-- [Encoded Transform](https://www.w3.org/TR/webrtc-encoded-transform)
-
-**Open Questions:**
-- Should we use `CopyOnWriteBuffer` or rather `ArraView<uint8_t>` for transformation
-- Do we need on libwebrtc level to have single "Transformer" interface. 
-  Maybe it's fine to split it into encrypter and decrypter, and let browser level code decide which to create.
-  Instead of having an generic `RTCSFrameTransformer` with `SFrameRole` in the parameter, we could create a separate objects for handling encryption and decryption.
-
-```cpp
-  class RTCSFrameEncryptor : public SFrameTransformerInterface {
-  public:
-    explicit RTCSFrameEncryptor(SFrameCipherSuite cipher_suite);
-    // Implementation handles the crypto details
-  };
-
-  class RTCSFrameDecryptor : public SFrameTransformerInterface {
-  public:
-    explicit RTCSFrameDecryptor(SFrameCipherSuite cipher_suite);
-    // Implementation handles the crypto details
-  };
+auto sframe_transform = CreateSFrameSenderTransform(options,
+                                                      transceiver.sender(),
+                                                      worker_thread);
 ```

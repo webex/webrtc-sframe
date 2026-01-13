@@ -2,12 +2,9 @@
 
 ## Overview
 
-This document describes how to integrate SFrame (Secure Frame) decryption into the WebRTC video receiver pipeline. The goal is to add secure end-to-end video reception capabilities while working with the existing RTP receiver infrastructure.
+This document describes how to integrate SFrame (Secure Frame) decryption into the WebRTC video receiver pipeline. The goal is to add secure end-to-end video reception capabilities using specialized receiver transforms.
 
-SFrame decryption can work at two levels:
-
-- **Per-frame**: Decrypts complete video frames after assembling them from RTP packets
-- **Per-packet**: Decrypts individual RTP packets before frame assembly
+SFrame decryption works at the frame level, transforming complete video frames after RTP depacketization.
 
 ## SFrame Transformer Initialization Flow
 
@@ -28,30 +25,28 @@ sequenceDiagram
     Note over User, RtpVideoReceiver: SFrame Transformer Initialization Flow
 
     %% API Level Initialization
-    User->>API: Call SetSFrameTransformer(transformer, options)
+    User->>API: Call CreateSFrameReceiverTransform(options, host)
     Note over User, API: 1. API Entry Point
-    Note right of User: User provides:<br/>- SFrameTransformerInterface<br/>- SFrameOptions (per-frame/per-packet mode)
+    Note right of User: User provides:<br/>- SFrameTransformOptions<br/>- FrameTransformerHost* (receiver)
 
     %% VideoRtpReceiver Processing
-    API->>Base: SetSFrameTransformer(transformer, options)
+    API->>Base: SetFrameTransformer(transformer, options)
     Note over API, Base: 2. Base Implementation
-    Base->>Base: Store sframe_transformer_ reference
+    Base->>Base: Store frame_transformer_ reference
 
     %% Validation and Processing
     Note over Base: 3. Validation Passed
-    Base->>Channel: SetSFrameTransformer(ssrc_, transformer, options)
+    Base->>Channel: SetFrameTransformer(ssrc_, transformer)
     Note over Base, Channel: 4. Media Channel Configuration
 
     %% Stream Lookup and Configuration
     Channel->>Channel: find(ssrc) in receive_streams_
     Note over Channel: 5. Stream Located Successfully
-    Channel->>Stream: SetSFrameTransformer(transformer, options)
+    Channel->>Stream: SetFrameTransformer(transformer)
 
     %% Stream Configuration Update
     Note over Channel, Stream: 6. Stream Configuration
-    Stream->>Stream: Update config_.sframe_stream_config.sframe_transformer
-    Stream->>Stream: Update config_.sframe_stream_config.sframe_options
-    Stream->>Stream: Set config_.sframe_stream_config.require_sframe = true
+    Stream->>Stream: Apply frame transformer to stream
     Note right of Stream: VideoReceiveStream::Config updated<br/>with SFrame settings
 
     %% Stream Recreation and Creation Pipeline
@@ -79,537 +74,173 @@ sequenceDiagram
 
 ### Key Flow Steps:
 
-1. **API Entry Point**: User calls `SetSFrameTransformer()` with transformer and options
+1. **API Entry Point**: User calls `SetFrameTransformer()` with SFrame transformer
 2. **Base Implementation**: `VideoRtpReceiver` stores the transformer and validates readiness
 3. **Media Channel**: `WebRtcVideoReceiveChannel` locates the correct stream by SSRC
 4. **Stream Configuration**: `WebRtcVideoReceiveStream` updates configuration parameters in place
 5. **Stream Recreation**: Existing streams are recreated to apply new SFrame settings
 6. **Creation Pipeline**: Settings flow through Call → VideoReceiveStream2 → RtpVideoStreamReceiver2
-7. **Ready for Decryption**: RtpVideoStreamReceiver2 is now ready to decrypt frames/packets
+7. **Ready for Decryption**: RtpVideoStreamReceiver2 is now ready to decrypt frames
 
-Once initialization is complete, the RtpVideoStreamReceiver2 component can perform decryption at two levels based on the configured `SFrameOptions`.
+Once initialization is complete, the RtpVideoStreamReceiver2 component can perform frame-level decryption based on the configured `SFrameOptions`.
 
 ## C++ API Proposal
 
 ### Basic API Structure
 
-The integration starts with extending `RtpReceiverInterface` to support SFrame transformers. This gives applications a clean way to inject decryption at the receiver level.
+The integration uses the FrameTransformerHost interface implemented by RtpReceiverInterface.
+This existing interface will be used to pass down to the `RtpVideoStreamReceiver2` the `SFrame` transformer.
 
 ```cpp
-class RtpReceiverInterface : public SFrameTransformerHost {
+class RtpReceiverInterface : public RefCountInterface,
+                             public FrameTransformerHost {
  public:
-  /**
-   * Sets up SFrame decryption for this RTP receiver.
-   * @param sframe_transformer The decryption implementation
-   * @param options Configuration for how SFrame should operate
-   */
-  virtual void SetSFrameTransformer(
-      scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-      SFrameOptions options) = 0;
-
-  virtual scoped_refptr<SFrameTransformerInterface> GetSFrameTransformer() = 0;
+  // Sets frame-level transformer
+  void SetFrameTransformer(
+      scoped_refptr<FrameTransformerInterface> frame_transformer) override;
 };
 ```
 
-## Implementation Architecture
+Skipping passthrough steps here as it's not relevant for the architecture.
 
-### VideoRtpReceiver
-
-`VideoRtpReceiver` is the main implementation that inherits from `RtpReceiverInternal`. Here's how it handles SFrame configuration:
-
-```cpp
-class VideoRtpReceiver: public RtpReceiverInternal {
- public:
-  /**
-   * Sets up the SFrame transformer and passes the configuration
-   * down to the media channel layer.
-   */
-  void SetSFrameTransformer(
-      scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-      SFrameOptions options) override;
-
-  scoped_refptr<SFrameTransformerInterface> GetSFrameTransformer() override;
-
- private:
-  // Keeps a reference to the configured SFrame transformer
-  scoped_refptr<SFrameTransformerInterface> sframe_transformer_;
-};
-```
-
-The implementation makes sure SFrame configuration is safely passed to the media channel:
-
-```cpp
-void VideoRtpReceiver::SetSFrameTransformer(
-    scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-    SFrameOptions options) {
-  sframe_transformer_ = sframe_transformer;
-
-  // Pass configuration to media channel if everything is ready
-  if (media_channel_ && ssrc_) {
-    worker_thread_->BlockingCall([&] {
-      media_channel_->SetSFrameTransformer(ssrc_, sframe_transformer, options);
-    });
-  }
-}
-
-scoped_refptr<SFrameTransformerInterface> VideoRtpReceiver::GetSFrameTransformer()  {
-  return sframe_transformer_;
-}
-```
-
-## SFrameStreamConfig
-
-The `SFrameStreamConfig` structure consolidates all SFrame-related configuration parameters for media streams. This configuration structure is utilized by both media senders and receivers, with each maintaining its own instance to ensure proper encapsulation of SFrame settings.
-
-The structure contains three primary components: `SFrameOptions` and `SFrameTransformerInterface` are populated through the `SetSFrameTransformer` API call, while the `require_sframe` property is configured separately during SDP negotiation. This separation is necessary to accommodate scenarios where SFrame may be enabled through sender-side configuration without necessarily having a transformer available on the receiver side.
-
-```cpp
-struct SFrameStreamConfig {
-  // SDP negotiated if we should require SFrame
-  bool require_sframe;
-
-  // Options provided with `SetSFrameTransformer`
-  // Should it be optional ? Or simply keep defaults?
-  SFrameOptions options;
-
-  // Transformer
-  scoped_refptr<SFrameTransformerInterface> sframe_transformer;
-};
-```
-
-## Media Channel Layer
-
-### Extending VideoMediaReceiveChannelInterface
-
-To support SFrame at the media channel level, we need to extend the interface with a new method:
-
-```cpp
-class VideoMediaReceiveChannelInterface {
- public:
-  /**
-   * Configures SFrame decryption for a specific stream.
-   * @param ssrc The stream identifier
-   * @param sframe_transformer The decryption implementation
-   * @param options How SFrame should operate (per-frame vs per-packet)
-   */
-  virtual void SetSFrameTransformer(
-      uint32_t ssrc,
-      scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-      SFrameOptions options) = 0;
-};
-```
-
-### WebRtcVideoReceiveChannel Implementation
-
-This is where SFrame configuration gets applied to actual video streams:
-
-```cpp
-class WebRtcVideoReceiveChannel : public VideoMediaReceiveChannelInterface {
- public:
-  /**
-   * Finds the right video stream and applies SFrame configuration to it.
-   */
-  void SetSFrameTransformer(
-      uint32_t ssrc,
-      scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-      SFrameOptions options) override;
-};
-```
-
-The implementation looks up the correct stream and handles errors gracefully:
-
-```cpp
-void WebRtcVideoReceiveChannel::SetSFrameTransformer(
-    uint32_t ssrc,
-    scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-    SFrameOptions options) {
-  RTC_DCHECK_RUN_ON(&thread_checker_);
-
-  auto matching_stream = receive_streams_.find(ssrc);
-  if (matching_stream != receive_streams_.end()) {
-    matching_stream->second->SetSFrameTransformer(sframe_transformer, options);
-  } else {
-    RTC_LOG(LS_ERROR) << "Could not find receive stream with SSRC " << ssrc
-                      << " to configure SFrame decryption";
-  }
-}
-```
-
-### Individual Stream Configuration
-
-Each video stream is represented by a `WebRtcVideoReceiveStream` object. When SFrame configuration is applied, the stream must be recreated to properly integrate the new decryption settings. The configuration parameters are stored within the `SFrameStreamConfig` structure, which is embedded in the stream's configuration hierarchy for centralized management.
-
-```cpp
-struct VideoReceiveStreamParameters {
-  /* Other fields */
-  VideoReceiveStreamInterface::Config config;
-};
-
-struct VideoReceiveStreamInterface::Config {
-  /* Other fields */
-  SFrameStreamConfig sframe_stream_config;
-};
-```
-
-```cpp
-class WebRtcVideoReceiveStream {
- public:
-  /**
-   * Applies SFrame configuration to this video stream.
-   * This triggers recreation of the underlying WebRTC stream.
-   */
-  void SetSFrameTransformer(
-      scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-      SFrameOptions options);
-
-  // Holds configuration of the stream
-  VideoReceiveStreamInterface::Config config_;
-};
-```
-
-Here's how stream recreation works:
-
-```cpp
-void WebRtcVideoReceiveChannel::WebRtcVideoReceiveStream::SetSFrameTransformer(
-    scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-    SFrameOptions options) {
-  RTC_DCHECK_RUN_ON(&thread_checker_);
-
-  // Update the stream configuration
-  config_.sframe_stream_config.sframe_transformer = sframe_transformer;
-  config_.sframe_stream_config.sframe_options = options;
-  // NOTE: require_sframe is not automatically set - this is a current gap
-
-  // Recreate the stream with new SFrame settings
-  if (stream_) {
-    RTC_LOG(LS_INFO)
-        << "Setting SFrameTransformer (recv) because of SetSFrameTransformer, "
-           "remote_ssrc="
-        << config_.rtp.remote_ssrc;
-    stream_->SetSFrameTransformer(sframe_transformer, options);
-  }
-}
-```
-
-### MediaReceiveStreamInterface
-
-Extend `MediaReceiveStreamInterface` with new method which will allow passing by provided `SFrameTransformer`.
-
-```cpp
-class MediaReceiveStreamInterface : public ReceiveStreamInterface {
- public:
-
-  virtual void SetSFrameTransformer(
-      scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-      SFrameOptions options) = 0;
-};
-```
-
-It will be inherited by `VideoReceiveStreamInterface`.
-
-### VideoReceiveStream2
-
-`VideoReceiveStream2` inherits from `MediaReceiveStreamInterface` and implements `SetSFrameTransformer` method to pass created `SFrameTransformer` into `RtpVideoStreamReceiver2` object which performs actual media actions.
-
-```cpp
-void VideoReceiveStream2::SetSFrameTransformer(
-    scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-    SFrameOptions sframe_options) {
-  rtp_video_stream_receiver_.SetSFrameTransformer(std::move(sframe_transformer),
-                                                  sframe_options);
-}
-```
-
-### RtpVideoStreamReceiver2
-
-```cpp
-void RtpVideoStreamReceiver2::SetSFrameTransformer(
-    scoped_refptr<SFrameTransformerInterface> sframe_transformer,
-    SFrameOptions sframe_options) {
-  RTC_DCHECK_RUN_ON(&packet_sequence_checker_);
-  if (sframe_transformer) {
-    sframe_decryptor_ = std::make_unique<VideoSFrameDecryptor>(
-        std::move(sframe_transformer), sframe_options);
-  } else {
-    sframe_decryptor_.reset();
-  }
-}
-```
-
-## RTP Video Stream Receiver - Where Decryption Happens
-
-### VideoSFrameDecryptor
-
-The `VideoSFrameDecryptor` class provides a clean abstraction layer that encapsulates all SFrame-related decryption operations for video streams. This design promotes better code organization and maintainability by consolidating decryption logic within a dedicated component.
-
-```cpp
-class VideoSFrameDecryptor {
- public:
-  enum class DecryptionResult {
-    kSuccess,
-    kFailure,
-    kDrop,
-    kSkip,
-  };
-
-  VideoSFrameDecryptor(scoped_refptr<SFrameTransformerInterface> sframe_transformer, SFrameOptions options_);
-
-  ~VideoSFrameDecryptor();
-
-  DecryptionResult MaybeDecryptFrame(CopyOnWriteBuffer& payload);
-
-  DecryptionResult MaybeDecryptPacket(CopyOnWriteBuffer& payload);
-
- private:
-  scoped_refptr<SFrameTransformerInterface> sframe_transformer_;
-
-  SFrameOptions options_;
-};
-```
-
-The implementation handles all operations required to perform SFrame decryption, providing a standardized interface for both per-frame and per-packet decryption modes.
-
-Example code:
-```cpp
-VideoSFrameDecryptor::DecryptionResult VideoSFrameDecryptor::MaybeDecryptFrame(
-    CopyOnWriteBuffer& payload) {
-  if (sframe_options_.mode == SFrameMode::kPerPacket) {
-    return DecryptionResult::kSkip;
-  }
-
-  if (!sframe_transformer_) {
-    return DecryptionResult::kDrop;
-  }
-
-  sframe_transformer_->Transform(payload);
-
-  return DecryptionResult::kSuccess;
-}
-```
-
-**Summary**: Manages per-frame SFrame decryption by validating the decryption mode, verifying transformer availability, applying SFrame decryption to the complete frame payload in-place.
-
-```cpp
-VideoSFrameDecryptor::DecryptionResult
-VideoSFrameDecryptor::MaybeDecryptPacket(CopyOnWriteBuffer& payload) {
-  if (sframe_options_.mode == SFrameMode::kPerFrame) {
-    return DecryptionResult::kSkip;
-  }
-
-  if (!sframe_transformer_) {
-    return DecryptionResult::kDrop;
-  }
-
-  sframe_transformer_->Transform(payload);
-
-  return DecryptionResult::kSuccess;
-}
-```
-
-**Summary**: Manages per-packet SFrame decryption by validating the decryption mode, verifying transformer availability, applying SFrame decryption to the packet payload directly, and modifying the payload in-place with decrypted data.
 
 ### RtpVideoStreamReceiver2 Configuration
 
-The `RtpVideoStreamReceiver2` is configured during construction based on the SFrame settings in the `VideoReceiveStreamInterface::Config` or with `SetSFrameTransformer` as shown above.
+The `RtpVideoStreamReceiver2::Config` structure is extended with additional fields to support SFrame decryption capabilities.
+[SFrameOptions]() will be fed into `RtpVideoStreamReceiver2` during the creation steps
 
 ```cpp
 class RtpVideoStreamReceiver2 : public RtpPacketSinkInterface {
  public:
-  RtpVideoStreamReceiver2(
-      const Environment& env,
-      TaskQueueBase* current_queue,
-      Transport* transport,
-      RtcpRttStats* rtt_stats,
-      PacketRouter* packet_router,
-      const VideoReceiveStreamInterface::Config* config,
-      /* ... other parameters ... */);
+  struct Config {
+    /* Other configuration fields */
+
+    scoped_refptr<FrameTransformerInterface> frame_transformer;
+    SFrameOptions sframe_options;
+  };
 
  private:
-  std::unique_ptr<VideoSFrameDecryptor> sframe_decryptor_;
+  scoped_refptr<FrameTransformerInterface> frame_transformer_delegate_;
+  SFrameOptions sframe_options_;
 };
 ```
 
 ### RtpVideoStreamReceiver2 Construction
 
-The `RtpVideoStreamReceiver2` constructor conditionally instantiates the `VideoSFrameDecryptor` based on the SFrame requirement configuration, ensuring optimal resource utilization.
+The `RtpVideoStreamReceiver2` constructor stores the SFrame configuration directly:
 
 ```cpp
-RtpVideoStreamReceiver2::RtpVideoStreamReceiver2(
-    const VideoReceiveStreamInterface::Config* config)
-    : /* ... other initializations ... */ {
-  
-  // Initialize SFrame decryptor if require_frame_encryption is enabled and
-  // SFrame transformer is provided in config
-  if (config->sframe_stream_config.require_sframe) {
-    sframe_decryptor_ = std::make_unique<VideoSFrameDecryptor>(
-        config->sframe_stream_config.sframe_transformer,
-        config->sframe_stream_config.sframe_options);
-  }
-}
+RtpVideoStreamReceiver2::RtpVideoStreamReceiver2(const Config& config)
+    : frame_transformer_delegate_(/* params */),
+      sframe_options_(config.sframe_options) {}
 ```
 
 ### SFrame Transformation Flow in RtpVideoStreamReceiver2
 
-The following diagram shows how received RTP packets and assembled frames flow through RtpVideoStreamReceiver2 and where SFrame decryption is applied:
+The following diagram shows how assembled video frames flow through RtpVideoStreamReceiver2 and where SFrame decryption is applied:
 
 ```mermaid
 flowchart TD
-    A[Received RTP Packet] --> B[OnReceivedPayloadData]
+    A[Received RTP Packets] --> B[RtpVideoStreamReceiver2::OnReceivedPayloadData]
+
+    B --> C[Depacketization]
     
-    B --> C[VideoSFrameDecryptor::<br/>MaybeDecryptPacket]
+    C --> D[Frame Assembly]
     
-    C --> C1{Decryption Result}
+    D --> E[RtpVideoStreamReceiver2::<br/>OnAssembledFrame]
     
-    C1 -->|kSuccess| D[Packet Decrypted<br/>Continue Processing]
-    C1 -->|kSkip| E[No Packet Decryption<br/>Per-Frame Mode]
-    C1 -->|kDrop/kFailure| Z[Drop Packet<br/>Return]
+    E --> F{Frame Transformer?}
     
-    D --> F[Depacketization]
-    E --> F
+    F -->|SFrame Available| G[Frame Decrypted<br/>SFrame → Original Codec]
+    F -->|No Transformer| H[Original Frame<br/>Original Codec Type]
     
-    F --> G[Frame Assembly]
+    G --> I[Pass to Decoder]
+    H --> I
     
-    G --> H[StartNextDecode]
+    I --> J[Decoded Video<br/>Ready for Rendering]
     
-    H --> I[VideoSFrameDecryptor::<br/>MaybeDecryptFrame]
-    
-    I --> I1{Decryption Result}
-    
-    I1 -->|kSuccess| J[Frame Decrypted<br/>Headers Updated]
-    I1 -->|kSkip| K[No Frame Decryption<br/>Per-Packet Mode]
-    I1 -->|kDrop/kFailure| Z1[Drop Frame<br/>Return]
-    
-    J --> L[Pass to Decoder]
-    K --> L
-    
-    L --> M[Decrypted Video Data<br/>Ready for Rendering]
-    
-    style C fill:#e1f5fe
-    style D fill:#fff3e0
-    style I fill:#e1f5fe
-    style J fill:#fff3e0
-    style M fill:#c8e6c9
-    style Z fill:#ffcdd2
-    style Z1 fill:#ffcdd2
+    style E fill:#e1f5fe
+    style G fill:#fff3e0
+    style J fill:#c8e6c9
 ```
 
 ### RtpVideoStreamReceiver2 Overview
 
-The `RtpVideoStreamReceiver2` class is where the actual video processing happens. It receives RTP packets and assembles them into complete frames.
+The `RtpVideoStreamReceiver2` class is where the actual video processing happens. It receives RTP packets, performs depacketization, and assembles them into complete frames.
 
-### Processing Received Packets
+### Depacketization Format Selection
 
-When `RtpVideoStreamReceiver2` receives an RTP packet, it can apply SFrame decryption at the appropriate point in the pipeline:
+Depacketizers map will be filled with SFrame depacketizers based on the `use_sframe` flag.
 
+`modules/video_coding/rtp_video_stream_receiver2.cc`
 ```cpp
-void RtpVideoStreamReceiver2::OnReceivedPayloadData(
-    ArrayView<const uint8_t> payload,
-    const RtpPacketReceived& rtp_packet,
-    const RTPVideoHeader& video) {
-  
-  // Apply per-packet SFrame decryption before depacketization
-  if (sframe_decryptor_) {
-    CopyOnWriteBuffer payload_buffer = rtp_packet.PayloadBuffer();
-    
-    switch (sframe_decryptor_->MaybeDecryptPacket(payload_buffer)) {
-      case VideoSFrameDecryptor::DecryptionResult::kDrop:
-        // Drop packet if decryption fails or transformer not available
-        return;
-      case VideoSFrameDecryptor::DecryptionResult::kSuccess:
-        // Packet decrypted successfully
-        break;
-      case VideoSFrameDecryptor::DecryptionResult::kFailure:
-        // Decryption failed, drop packet
-        return;
-      case VideoSFrameDecryptor::DecryptionResult::kSkip:
-        // Per-frame mode configured, continue with normal processing
-        break;
-    }
+void RtpVideoStreamReceiver2::AddReceiveCodec(
+    uint8_t payload_type,
+    VideoCodecType video_codec,
+    const CodecParameterMap& codec_params,
+    bool raw_payload) {
+  RTC_DCHECK_RUN_ON(&packet_sequence_checker_);
+  if (codec_params.count(kH264FmtpSpsPpsIdrInKeyframe) > 0 ||
+      env_.field_trials().IsEnabled("WebRTC-SpsPpsIdrIsH264Keyframe")) {
+    packet_buffer_.ForceSpsPpsIdrIsH264Keyframe();
+    sps_pps_idr_is_h264_keyframe_ = true;
   }
 
-  // Continue with standard depacketization and frame assembly
-  // ...
-}
-```
-
-### SFrame Decryption Integration in Frame Processing
-
-SFrame frame-level decryption is performed in the `StartNextDecode()` method after frame assembly. This happens before the frame is passed to the reference finder or decoder pipeline:
-
-```cpp
-void RtpVideoStreamReceiver2::StartNextDecode() {
-  // ... frame selection logic ...
-  
-  // Attempt SFrame frame-level decryption if decryptor is available
-  if (sframe_decryptor_) {
-    auto decryption_result = sframe_decryptor_->MaybeDecryptFrame(frame->GetEncodedData());
-    switch (decryption_result) {
-      case VideoSFrameDecryptor::DecryptionResult::kDrop:
-        // Drop frame if decryption fails
-        return;
-      case VideoSFrameDecryptor::DecryptionResult::kFailure:
-        // Continue processing even if decryption failed
-        return;
-      case VideoSFrameDecryptor::DecryptionResult::kSuccess:
-        // Frame has been decrypted, update frame data
-        break;
-      case VideoSFrameDecryptor::DecryptionResult::kSkip:
-        // SFrame decryption not applicable, continue with normal processing
-        break;
-    }
-  }
-
-  // Pass to frame transformer or reference finder
-  if (buffered_frame_decryptor_ != nullptr) {
-    buffered_frame_decryptor_->ManageEncryptedFrame(std::move(frame));
-  } else if (frame_transformer_delegate_) {
-    frame_transformer_delegate_->TransformFrame(std::move(frame));
+  if (config_.sframe_options.use_sframe) {
+    payload_type_map_.emplace(
+        payload_type, std::make_unique<VideoRtpDepacketizerSFrame>());
   } else {
-    // Frame continues to reference finder and eventually to decoder
-    reference_finder_->ManageFrame(std::move(frame));
+    payload_type_map_.emplace(
+      payload_type, raw_payload ? std::make_unique<VideoRtpDepacketizerRaw>()
+                                : CreateVideoRtpDepacketizer(video_codec));
   }
+
+  pt_codec_params_.emplace(payload_type, codec_params);
+  pt_codec_.emplace(payload_type, video_codec);
 }
 ```
 
-The method processes the decrypted frame through the normal WebRTC pipeline, either through frame transformers or directly to the reference finder for eventual delivery to the decoder.
-
-## SFrame Depacketizer
+### SFrame Depacketizer
 
 SFrame decryption requires specialized depacketization to handle the encrypted payload format. The `VideoRtpDepacketizerSFrame` class provides this functionality by extending the standard RTP depacketization interface.
 
+`modules/rtp_rtcp/source/video_rtp_depacketizer_sframe.h`
 ```cpp
 class VideoRtpDepacketizerSFrame : public VideoRtpDepacketizer {
  public:
+  VideoRtpDepacketizerSFrame() = default;
+  VideoRtpDepacketizerSFrame(const VideoRtpDepacketizerSFrame&) = delete;
+  VideoRtpDepacketizerSFrame& operator=(const VideoRtpDepacketizerSFrame&) = delete;
+
   ~VideoRtpDepacketizerSFrame() override = default;
 
-  std::optional<ParsedRtpPayload> Parse(CopyOnWriteBuffer rtp_payload) override;
-
- private:
-  // SFrame RTP header size is always 1 byte
-  static constexpr size_t kSFrameRtpHeaderSize = 1;
-};
+  std::optional<ParsedRtpPayload> Parse(
+      const CopyOnWriteBuffer& rtp_payload) override;
+}; 
 ```
 
-The depacketizer handles SFrame-specific RTP payload format, extracting the SFrame ciphertext from the RTP payload and preparing it for decryption. The depacketizer processes the SFrame RTP header to determine packet boundaries and reassembly information.
+The depacketizer handles SFrame-specific RTP payload format, extracting the SFrame ciphertext from the RTP payload and preparing it for frame-level decryption. Once depacketized, the encrypted frame data flows through the frame transformer pipeline for decryption before being passed to the decoder.
 
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|V=2|P|X|  CC   |M|     PT      |       sequence number         |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                           timestamp                           |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|           synchronization source (SSRC) identifier            |
-+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
-|            contributing source (CSRC) identifiers             |
-|                             ....                              |
-+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
-|S E x x x x x x|                                               |
-|                                                               |
-:                       SFrame payload                          :
-|                                                               |
-|                               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                               :    OPTIONAL RTP padding       |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+### Processing Assembled Frames
+
+When `RtpVideoStreamReceiver2` has assembled a complete frame, it can either process it through the frame transformer pipeline or handle it directly.
+In `SFrame` enabled scenario, we need to make sure that if `SFrame` is required, we must have transformer. Otherwise, we must drop frame.
+
+`modules/video_coding/rtp_video_stream_receiver2.cc`
+```cpp
+void RtpVideoStreamReceiver2::OnAssembledFrame(
+    std::unique_ptr<RtpFrameObject> frame) {
+  // ... frame validation and codec management ...
+  
+  // If there's a frame transformer, use it (this handles SFrame decryption)
+  if (frame_transformer_delegate_) {
+    frame_transformer_delegate_->TransformFrame(std::move(frame));
+  } else if (config_.sframe_options.use_sframe) {
+    // If we require sframe, we must have frame transformer - drop frame
+    return;
+  } else {
+    // Continue with standard frame processing
+    OnCompleteFrames(reference_finder_->ManageFrame(std::move(frame)));
+  }
+}
 ```
