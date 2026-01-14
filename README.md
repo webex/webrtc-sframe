@@ -583,7 +583,7 @@ sequenceDiagram
     Note over App,Transformer: Old key removed, only new key remains
 ```
 
-### FrameTransformer Installation Flow
+### RtpSender FrameTransformer Installation Flow
 
 ```mermaid
 sequenceDiagram
@@ -591,7 +591,6 @@ sequenceDiagram
     participant Sender as RtpSenderBase
     participant Passthrough as Internal Layers (Passthrough)
     participant VideoSender as RTPSenderVideo
-    participant Pipeline as Media Pipeline
 
     App->>Sender: SetFrameTransformer(transformer)
     
@@ -606,19 +605,10 @@ sequenceDiagram
     Passthrough-->>Sender: return success
     Sender-->>App: return success
     
-    Note over App,Pipeline: Frame transformer now active in media pipeline
-    
-    rect rgb(240, 255, 240)
-        Note over Pipeline: During media processing...
-        Pipeline->>Pipeline: Encode frame
-        Pipeline->>transformer: Transform(encoded_frame)
-        transformer-->>Pipeline: return encrypted_frame
-        Pipeline->>Pipeline: Packetize encrypted frame
-        Pipeline->>Pipeline: Send to network
-    end
+    Note over VideoSender : Frame transformer is now active in media pipeline
 ```
 
-### Packet Transformer Installation Flow
+### RtpSender PacketTransformer Installation Flow
 
 ```mermaid
 sequenceDiagram
@@ -626,7 +616,6 @@ sequenceDiagram
     participant Sender as RtpSenderBase
     participant Passthrough as Internal Layers (Passthrough)
     participant VideoSender as RTPSenderVideo
-    participant Pipeline as Media Pipeline
 
     App->>Sender: SetPacketTransformer(transformer)
     
@@ -641,15 +630,6 @@ sequenceDiagram
     Passthrough-->>Sender: return success
     Sender-->>App: return success
     
-    Note over App,Pipeline: Packet transformer now active in media pipeline
-    
-    rect rgb(240, 255, 240)
-        Note over Pipeline: During media processing...
-        Pipeline->>Pipeline: Encode frame
-        Pipeline->>Pipeline: Packetize frame
-        Pipeline->>transformer: Transform(packet)
-        transformer-->>Pipeline: return encrypted_packet
-        Pipeline->>Pipeline: Send to network
-    end
+    Note over VideoSender: Packet transformer now active in media pipeline
 ```
 
