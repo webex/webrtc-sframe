@@ -25,52 +25,43 @@ sequenceDiagram
 
     App->>T: 1. SetUseSFrame(true)
     
-    rect rgb(255, 245, 230)
-        Note over T: Propagate SFrame enablement to RTP interfaces
-        T->>S: Enable SFrame encryption
-        S-->>T: SFrame enabled on sender
-        T->>R: Enable SFrame decryption
-        R-->>T: SFrame enabled on receiver
-    end
-    
+    Note over T: STEP 2: Propagate SFrame enablement to RTP interfaces
+    T->>S: Enable SFrame encryption
+    S-->>T: SFrame enabled on sender
+    T->>R: Enable SFrame decryption
+    R-->>T: SFrame enabled on receiver
     T-->>App: return success
     
-    rect rgb(255, 240, 230)
-        Note over T: Triggers negotiation needed
-        T->>App: 2. on negotiation needed event
+    Note over T: STEP 3: Triggers negotiation needed
+    T->>App: on negotiation needed event
+    
+    Note over App,SenderTransform: STEP 4: Application handles sender setup
+    App->>SenderTransform: Create SFrameSenderTransform(options, sender, thread)
+    
+    alt sframe_mode == kFrame
+        SenderTransform->>S: SetFrameTransformer(SFrameSenderTransformer.AsFrameTransformer())
+        S-->>SenderTransform: Frame transformer assigned
+    else sframe_mode == kPacket
+        SenderTransform->>S: SetPacketTransformer(SFrameSenderTransformer.AsPacketTransformer())
+        S-->>SenderTransform: Packet transformer assigned
     end
     
-    rect rgb(230, 255, 230)
-        Note over App: Application handles sender setup
-        App->>SenderTransform: 3a. Create SFrameSenderTransform(options, sender, thread)
-        
-        alt sframe_mode == kFrame
-            SenderTransform->>S: SetFrameTransformer(SFrameSenderTransformer.AsFrameTransformer())
-            S-->>SenderTransform: Frame transformer assigned
-        else sframe_mode == kPacket
-            SenderTransform->>S: SetPacketTransformer(SFrameSenderTransformer.AsPacketTransformer())
-            S-->>SenderTransform: Packet transformer assigned
-        end
-        
-        SenderTransform-->>App: Sender transform configured
+    SenderTransform-->>App: Sender transform configured
+    
+    Note over App,ReceiverTransform: STEP 5: Application handles receiver setup
+    App->>ReceiverTransform: Create SFrameReceiverTransform(options, receiver, thread)
+    
+    alt sframe_mode == kFrame
+        ReceiverTransform->>R: SetFrameTransformer(SFrameReceiverFrameTransformer)
+        R-->>ReceiverTransform: Frame transformer assigned
+    else sframe_mode == kPacket
+        ReceiverTransform->>R: SetPacketTransformer(SFrameReceiverPacketTransformer)
+        R-->>ReceiverTransform: Packet transformer assigned
     end
     
-    rect rgb(230, 240, 255)
-        Note over App: Application handles receiver setup
-        App->>ReceiverTransform: 4a. Create SFrameReceiverTransform(options, receiver, thread)
-        
-        alt sframe_mode == kFrame
-            ReceiverTransform->>R: SetFrameTransformer(SFrameReceiverFrameTransformer)
-            R-->>ReceiverTransform: Frame transformer assigned
-        else sframe_mode == kPacket
-            ReceiverTransform->>R: SetPacketTransformer(SFrameReceiverPacketTransformer)
-            R-->>ReceiverTransform: Packet transformer assigned
-        end
-        
-        ReceiverTransform-->>App: Receiver transform configured
-    end
+    ReceiverTransform-->>App: Receiver transform configured
     
-    Note over App,R: SFrame encryption/decryption now active in media pipeline
+    Note over App,R: ✓ SFrame encryption/decryption now active in media pipeline
 ```
 
 ## Core Interface Architecture
@@ -465,25 +456,18 @@ sequenceDiagram
     App->>SenderTransform: SetEncryptionKey(key, key_id)
     SenderTransform->>Proxy: SetEncryptionKey(key, key_id)
     
-    rect rgb(255, 240, 230)
-        Note over Proxy: Calling Thread
-        Proxy->>Proxy: PostTask to Worker Thread
-    end
+    Note over Proxy: Calling Thread - Post task to worker thread
+    Proxy->>Proxy: PostTask to Worker Thread
     
-    rect rgb(230, 255, 230)
-        Note over Transformer: Worker Thread
-        Proxy->>+Transformer: SetEncryptionKey(key, key_id)
-        Transformer-->>-Proxy: return success
-    end
+    Note over Transformer: Worker Thread - Execute key update
+    Proxy->>+Transformer: SetEncryptionKey(key, key_id)
+    Transformer-->>-Proxy: return success
     
-    rect rgb(255, 240, 230)
-        Note over Proxy: Calling Thread
-        Proxy-->>SenderTransform: return success
-    end
-    
+    Note over Proxy: Calling Thread - Return result
+    Proxy-->>SenderTransform: return success
     SenderTransform-->>App: return success
     
-    Note over App,Transformer: Key is now active for encryption
+    Note over App,Transformer: ✓ Key is now active for encryption
 ```
 
 ### Receiver Key Management Flow
@@ -498,50 +482,36 @@ sequenceDiagram
     App->>ReceiverTransform: AddDecryptionKey(key, key_id)
     ReceiverTransform->>Proxy: AddDecryptionKey(key, key_id)
     
-    rect rgb(255, 240, 230)
-        Note over Proxy: Calling Thread
-        Proxy->>Proxy: PostTask to Worker Thread
-    end
+    Note over Proxy: Calling Thread - Post task to worker thread
+    Proxy->>Proxy: PostTask to Worker Thread
     
-    rect rgb(230, 255, 230)
-        Note over Transformer: Worker Thread
-        Proxy->>+Transformer: AddDecryptionKey(key, key_id)
-        Transformer-->>-Proxy: return success
-    end
+    Note over Transformer: Worker Thread - Execute add key
+    Proxy->>+Transformer: AddDecryptionKey(key, key_id)
+    Transformer-->>-Proxy: return success
     
-    rect rgb(255, 240, 230)
-        Note over Proxy: Calling Thread
-        Proxy-->>ReceiverTransform: return success
-    end
-    
+    Note over Proxy: Calling Thread - Return result
+    Proxy-->>ReceiverTransform: return success
     ReceiverTransform-->>App: return success
     
-    Note over App,Transformer: New key available for decryption
+    Note over App,Transformer: ✓ New key available for decryption
     
     Note over App: Later, during key rotation...
     
     App->>ReceiverTransform: RemoveDecryptionKey(old_key_id)
     ReceiverTransform->>Proxy: RemoveDecryptionKey(old_key_id)
     
-    rect rgb(255, 240, 230)
-        Note over Proxy: Calling Thread
-        Proxy->>Proxy: PostTask to Worker Thread
-    end
+    Note over Proxy: Calling Thread - Post task to worker thread
+    Proxy->>Proxy: PostTask to Worker Thread
     
-    rect rgb(230, 255, 230)
-        Note over Transformer: Worker Thread
-        Proxy->>+Transformer: RemoveDecryptionKey(old_key_id)
-        Transformer-->>-Proxy: return success
-    end
+    Note over Transformer: Worker Thread - Execute remove key
+    Proxy->>+Transformer: RemoveDecryptionKey(old_key_id)
+    Transformer-->>-Proxy: return success
     
-    rect rgb(255, 240, 230)
-        Note over Proxy: Calling Thread
-        Proxy-->>ReceiverTransform: return success
-    end
-    
+    Note over Proxy: Calling Thread - Return result
+    Proxy-->>ReceiverTransform: return success
     ReceiverTransform-->>App: return success
     
-    Note over App,Transformer: Old key removed, only new key remains
+    Note over App,Transformer: ✓ Old key removed, only new key remains
 ```
 
 ### RtpSender FrameTransformer Installation Flow
