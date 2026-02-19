@@ -23,7 +23,7 @@ sequenceDiagram
 
     Note over App,R: SFrame Enablement and Setup Flow
 
-    App->>T: 1. SetUseSFrame(true)
+    App->>T: 1. EnableSframe()
     
     Note over T: STEP 2: Propagate SFrame enablement to RTP interfaces
     T->>S: Enable SFrame encryption
@@ -51,13 +51,11 @@ sequenceDiagram
     Note over App,ReceiverTransform: STEP 5: Application handles receiver setup
     App->>ReceiverTransform: Create SFrameReceiverTransform(options, receiver, thread)
     
-    alt sframe_mode == kFrame
-        ReceiverTransform->>R: SetFrameTransformer(SFrameReceiverFrameTransformer)
-        R-->>ReceiverTransform: Frame transformer assigned
-    else sframe_mode == kPacket
-        ReceiverTransform->>R: SetPacketTransformer(SFrameReceiverPacketTransformer)
-        R-->>ReceiverTransform: Packet transformer assigned
-    end
+    Note over ReceiverTransform,R: Install both transformers (T bit determines which is invoked)
+    ReceiverTransform->>R: SetFrameTransformer(SFrameReceiverTransformer.AsFrameTransformer())
+    R-->>ReceiverTransform: Frame transformer assigned
+    ReceiverTransform->>R: SetPacketTransformer(SFrameReceiverTransformer.AsPacketTransformer())
+    R-->>ReceiverTransform: Packet transformer assigned
     
     ReceiverTransform-->>App: Receiver transform configured
     
@@ -74,8 +72,8 @@ Extend `RtpTransceiverInterface` to enable setting `SFrame` configuration which 
 classDiagram
   class RtpTransceiverInterface {
     <<interface>>
-    +SetUseSFrame(bool)
-    +UseSFrame() bool
+    +EnableSframe()
+    +SframeEnabled() bool
   }
 ```
 
@@ -319,7 +317,12 @@ Transformer itself will always work on the worker thread, which will ensure that
 
 ### SFrameReceiverTransformer
 
-The `SFrameReceiverTransformer` provides SFrame decryption with factory methods to create appropriate transformer interfaces.
+The `SFrameReceiverTransformer` provides SFrame decryption with factory methods to create both frame and packet transformer interfaces. Unlike the sender, the receiver does not select a single SFrame mode up front. Instead, the receiver installs **both** a frame transformer and a packet transformer. The RTP receiver pipeline inspects the T bit in the SFrame payload descriptor of incoming packets to determine which path to invoke:
+
+- **T=0 (per-frame)**: Packets are reassembled into a complete SFrame ciphertext and routed to the frame transformer for frame-level decryption.
+- **T=1 (per-packet)**: Each packet is individually routed to the packet transformer for packet-level decryption. The assembled frame is then passed directly to the decoder without a second decryption stage.
+
+This design ensures the receiver can handle streams from any sender regardless of which SFrame mode the sender chose, and even adapt mid-session if the sender switches modes.
 
 ```mermaid
 classDiagram
@@ -329,10 +332,12 @@ classDiagram
         +RemoveDecryptionKey(key_id) bool
     }
     
+    class SFrameReceiverTransformOptions {
+        +cipher_suite: SFrameCipherSuite
+    }
+    
     class SFrameReceiverTransformer {
-        -options: SFrameTransformOptions
-        -cipher_suite: SFrameCipherSuite
-        -sframe_mode: SFrameMode
+        -options: SFrameReceiverTransformOptions
         +SFrameReceiverTransformer(options)
         +AddDecryptionKey(key, key_id) bool
         +RemoveDecryptionKey(key_id) bool
@@ -344,6 +349,7 @@ classDiagram
     }
     
     SFrameDecrypterInterface <|-- SFrameReceiverTransformer
+    SFrameReceiverTransformer --> SFrameReceiverTransformOptions
 ```
 
 > **Diamond Inheritance Issue**: `SFrameReceiverTransformer` cannot directly implement both `FrameTransformerInterface` and `PacketTransformerInterface` due to diamond inheritance from the common `TransformationFeatures` base interface. This would create ambiguity in method resolution and violate C++ inheritance rules. Therefore, the factory pattern with `AsFrameTransformer()` and `AsPacketTransformer()` methods is used to return separate wrapper objects that implement the respective interfaces.
@@ -356,48 +362,50 @@ sequenceDiagram
     participant PW as PacketTransformer Wrapper
     participant Receiver as RtpReceiver
 
-    Note over App,Receiver: SFrameReceiverTransformer Setup and Usage Flow
+    Note over App,Receiver: SFrameReceiverTransformer Setup Flow
 
     App->>RT: Create SFrameReceiverTransformer(options)
     RT-->>App: Return transformer instance
 
-    alt sframe_mode == kFrame
-        App->>RT: AsFrameTransformer()
-        RT->>FW: Create internal FrameTransformer wrapper
-        FW-->>RT: Wrapper created
-        RT-->>App: Return FrameTransformerInterface*
-        
-        App->>Receiver: SetFrameTransformer(wrapper)
-        Receiver-->>App: Frame transformer assigned
-        
-        Note over FW,Receiver: Frame transformation flow
-        Receiver->>FW: Transform(frame)
+    Note over App,Receiver: Install BOTH transformers (T bit selects at runtime)
+
+    App->>RT: AsFrameTransformer()
+    RT->>FW: Create internal FrameTransformer wrapper
+    FW-->>RT: Wrapper created
+    RT-->>App: Return FrameTransformerInterface*
+    App->>Receiver: SetFrameTransformer(wrapper)
+    Receiver-->>App: Frame transformer assigned
+
+    App->>RT: AsPacketTransformer()
+    RT->>PW: Create internal PacketTransformer wrapper
+    PW-->>RT: Wrapper created
+    RT-->>App: Return PacketTransformerInterface*
+    App->>Receiver: SetPacketTransformer(wrapper)
+    Receiver-->>App: Packet transformer assigned
+
+    Note over App,Receiver: Both transformers active in media pipeline
+
+    Note over Receiver: Runtime: T bit in SFrame descriptor determines path
+
+    alt T=0 (per-frame SFrame)
+        Note over Receiver,FW: Packets reassembled into frame ciphertext
+        Receiver->>FW: Transform(assembled_frame)
         FW->>RT: Delegate to SFrameReceiverTransformer
         RT-->>FW: Decrypted frame
-        FW-->>Receiver: Return transformed frame
-        
-    else sframe_mode == kPacket
-        App->>RT: AsPacketTransformer()
-        RT->>PW: Create internal PacketTransformer wrapper
-        PW-->>RT: Wrapper created
-        RT-->>App: Return PacketTransformerInterface*
-        
-        App->>Receiver: SetPacketTransformer(wrapper)
-        Receiver-->>App: Packet transformer assigned
-        
-        Note over PW,Receiver: Packet transformation flow
+        FW-->>Receiver: Return decrypted frame
+    else T=1 (per-packet SFrame)
+        Note over Receiver,PW: Each packet decrypted individually
         Receiver->>PW: Transform(packet)
         PW->>RT: Delegate to SFrameReceiverTransformer
         RT-->>PW: Decrypted packet
-        PW-->>Receiver: Return transformed packet
+        PW-->>Receiver: Return decrypted packet
+        Note over Receiver: Frame assembled from decrypted packets (no frame-level decryption)
     end
-
-    Note over App,Receiver: Transformer active in media pipeline
 ```
 
-> **Architecture Benefits**: The unified `SFrameReceiverTransformer` design provides a single decryption implementation that can be used for both frame and packet transformation through factory methods. This reduces code duplication while maintaining interface compatibility.
+> **Dual Transformer Design**: Unlike the sender (which picks one mode), the receiver always installs both frame and packet transformers. The RTP receiver pipeline inspects the T bit in the SFrame payload descriptor to determine which transformer to invoke. This avoids the need for out-of-band mode signaling on the receive side and allows the receiver to handle any sender configuration.
 
-> **Factory Methods**: `AsFrameTransformer()` and `AsPacketTransformer()` return wrapper objects that implement the respective interfaces and delegate transformation calls to the appropriate internal methods.
+> **Double Decryption Prevention**: When the T bit is 1 (per-packet), each packet is decrypted individually by the packet transformer. The assembled frame is then forwarded directly to the decoder, bypassing the frame transformer entirely. This is achieved by marking T=0 packets with a distinct video type header variant during reassembly, which the frame assembly stage checks before routing to the frame transformer.
 
 > **Key Management**: The receiver transformer can manage multiple decryption keys simultaneously to handle key rotation scenarios, where new keys are added before old keys are removed to ensure seamless decryption during key transitions.
 
@@ -426,19 +434,21 @@ The `SFrameReceiverTransform` class serves as the main orchestrator for receiver
 **Key Design Elements:**
 
 - **Unified Implementation**: Single `SFrameReceiverTransformer` handles both frame and packet decryption
-- **Internal Wrappers**: `AsFrameTransformer()` and `AsPacketTransformer()` return interface-specific wrappers
+- **Dual Transformer Installation**: Both `AsFrameTransformer()` and `AsPacketTransformer()` wrappers are always installed; the T bit determines which is invoked at runtime
 - **Proxy Wrapping**: The proxy wraps the `SFrameReceiverTransformer` instance for thread safety
 - **Thread Marshaling**: All `AddDecryptionKey()`/`RemoveDecryptionKey()` calls are automatically routed to the worker thread
 
 **Initialization Flow:**
 1. `SFrameReceiverTransform` constructor receives options, receiver, and worker thread
-2. Creates `SFrameReceiverTransformer` instance with decryption configuration
-3. Based on sframe mode, calls `AsFrameTransformer()` or `AsPacketTransformer()` to get interface wrapper
-4. Sets wrapper to corresponding transformation slot (`SetFrameTransformer`/`SetPacketTransformer`)
+2. Creates `SFrameReceiverTransformer` instance with decryption configuration (cipher suite only, no mode)
+3. Calls `AsFrameTransformer()` to get the frame transformer wrapper and sets it via `SetFrameTransformer()`
+4. Calls `AsPacketTransformer()` to get the packet transformer wrapper and sets it via `SetPacketTransformer()`
 5. Wraps transformer in `SFrameDecrypterProxy` for thread safety
 6. Stores the proxy as `transformer_`
 
 > **Thread Safety**: The proxy pattern ensures all key management operations are thread-safe by automatically marshaling calls from any thread to the designated worker thread. The transformer itself always works on the worker thread, ensuring single-threaded access to decryption state.
+
+> **Why both transformers?** The receiver cannot know ahead of time whether the sender is using per-frame (T=0) or per-packet (T=1) SFrame. The T bit is carried in the SFrame payload descriptor of each RTP packet. By installing both transformers, the RTP receiver pipeline can route to the correct decryption path based on the T bit value observed in the incoming packets.
 
 ## Media Pipeline Integration
 
