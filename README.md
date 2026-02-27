@@ -8,7 +8,7 @@ SFrame encryption can be applied at two levels:
 - **Per-frame** (`SframeMode::kPerFrame`): Encrypts complete video/audio frames before packetization
 - **Per-packet** (`SframeMode::kPerPacket`): Encrypts individual RTP packets after packetization
 
-Both modes are activated through the same public API on `RtpSenderInterface` and `RtpReceiverInterface`. The application creates an SFrame encrypter or decrypter by calling a method on the sender or receiver, receives a key management handle, and the internal pipeline handles transformer installation and SDP negotiation automatically.
+Both modes are enabled through the same public API on `RtpSenderInterface` and `RtpReceiverInterface`. The application creates an SFrame encrypter or decrypter by calling a method on the sender or receiver, receives a key management handle, and the internal pipeline handles encrypter/decrypter installation and SDP negotiation automatically.
 
 ## Architecture Overview
 
@@ -18,23 +18,25 @@ sequenceDiagram
     participant T as RtpTransceiver
     participant S as RtpSender
     participant R as RtpReceiver
-    participant EncHandle as SframeEncrypterInterface
-    participant DecHandle as SframeDecrypterInterface
+    participant EncHandle as Encrypter Handle
+    participant DecHandle as Decrypter Handle
 
-    Note over App,DecHandle: SFrame Activation Flow
+    Note over App,DecHandle: SFrame Enablement Flow
 
     App->>S: CreateSframeEncrypterOrError(options)
-    Note over S: Creates internal SFrame transformer<br/>Installs transformer in send pipeline
-    S->>T: OnSframeActivated() via observer
-    Note over T: Sets sframe_activated_ = true
-    S-->>App: RTCErrorOr<SframeEncrypterInterface>
+    Note over S: Creates internal SFrame encrypter<br/>Installs encrypter in send pipeline
+    S->>T: Notify SFrame enabled via observer
+    Note over T: Marks SFrame as enabled
+    T-->>S: RTCError::OK()
+    S-->>App: Encrypter handle (or error)
     App->>EncHandle: Store key management handle
 
     App->>R: CreateSframeDecrypterOrError(options)
-    Note over R: Creates internal SFrame transformer<br/>Installs transformer in receive pipeline
-    R->>T: OnSframeActivated() via observer
-    Note over T: Already activated, returns OK
-    R-->>App: RTCErrorOr<SframeDecrypterInterface>
+    Note over R: Creates internal SFrame decrypter<br/>Installs decrypter in receive pipeline
+    R->>T: Notify SFrame enabled via observer
+    Note over T: Already enabled, returns OK
+    T-->>R: RTCError::OK()
+    R-->>App: Decrypter handle (or error)
     App->>DecHandle: Store key management handle
 
     Note over T: Triggers onnegotiationneeded
@@ -44,13 +46,13 @@ sequenceDiagram
 
     Note over App,DecHandle: Key Management
 
-    App->>EncHandle: SetEncryptionKey(key_id, key_material)
+    App->>EncHandle: Set encryption key
     Note over EncHandle: Encryption key set on worker thread
 
-    App->>DecHandle: AddDecryptionKey(key_id, key_material)
+    App->>DecHandle: Add decryption key
     Note over DecHandle: Decryption key added on worker thread
 
-    Note over App,DecHandle: ✓ SFrame encryption/decryption active in media pipeline
+    Note over App,DecHandle: ✓ SFrame encryption/decryption enabled in media pipeline
 ```
 
 ## Public API
@@ -91,9 +93,7 @@ classDiagram
     RefCountInterface <|-- SframeEncrypterInterface
 ```
 
-The encrypter init carries both `mode` (per-frame or per-packet) and `cipher_suite`. The mode determines which internal transformer is created and how the send pipeline processes frames.
-
-The `key_material` parameter is the SFrame `base_key` — raw key bytes that the SFrame library uses as input to HKDF for deriving the actual encryption keys (per RFC 9605 §4.4).
+The encrypter init carries both `mode` (per-frame or per-packet) and `cipher_suite`. The mode determines how the send pipeline processes frames — either encrypting complete frames before packetization or encrypting individual packets after packetization. The `cipher_suite` selects the cryptographic algorithm used for encryption.
 
 ### SFrame Decrypter Configuration and Interface (`api/sframe/sframe_decrypter_interface.h`)
 
@@ -113,7 +113,9 @@ classDiagram
     RefCountInterface <|-- SframeDecrypterInterface
 ```
 
-The decrypter init carries only `cipher_suite` — the mode (per-frame or per-packet) is inferred from the received SFrame payload descriptor's T bit. The decrypter supports multiple simultaneous keys to handle key rotation scenarios, where new keys are added before old keys are removed.
+The decrypter init carries only `cipher_suite` — the mode (per-frame or per-packet) is automatically determined from the received encrypted data. The decrypter supports multiple simultaneous keys to handle key rotation scenarios, where new keys are added before old keys are removed.
+
+> **Note:** The SFrame header contains a `T` bit that indicates whether the payload is an encrypted full frame (`T=1`) or an encrypted packet (`T=0`). The decrypter uses this bit to automatically select the correct decryption path without requiring the application to specify the mode.
 
 ### API on RtpSenderInterface (`api/rtp_sender_interface.h`)
 
@@ -125,11 +127,10 @@ CreateSframeEncrypterOrError(const SframeEncrypterInit& options) {
 }
 ```
 
-Creates an internal SFrame encrypter, installs the appropriate transformer in the send pipeline, notifies the transceiver of SFrame activation, and returns a key management handle. The returned `SframeEncrypterInterface` is used solely for key management (`SetEncryptionKey`). Can only be called once per sender — subsequent calls return an error.
+Creates an internal SFrame encrypter, installs it in the send pipeline, notifies the transceiver of SFrame enablement, and returns a key management handle. The returned `SframeEncrypterInterface` is used solely for key management (`SetEncryptionKey`). Can only be called once per sender — subsequent calls return an error.
 
 **Errors:**
-- `UNSUPPORTED_OPERATION`: SFrame not yet implemented (stub)
-- `INVALID_MODIFICATION`: SFrame already activated on this transceiver
+- `INVALID_MODIFICATION`: SFrame negotiation has already been disabled on this transceiver (SFrame can only be enabled during the initial offer/answer exchange)
 
 ### API on RtpReceiverInterface (`api/rtp_receiver_interface.h`)
 
@@ -141,51 +142,51 @@ CreateSframeDecrypterOrError(const SframeDecrypterInit& options) {
 }
 ```
 
-Creates an internal SFrame decrypter, installs the appropriate transformer in the receive pipeline, notifies the transceiver of SFrame activation, and returns a key management handle. The returned `SframeDecrypterInterface` is used for key management (`AddDecryptionKey`, `RemoveDecryptionKey`). Can only be called once per receiver — subsequent calls return an error.
+Creates an internal SFrame decrypter, installs it in the receive pipeline, notifies the transceiver of SFrame enablement, and returns a key management handle. The returned `SframeDecrypterInterface` is used for key management (`AddDecryptionKey`, `RemoveDecryptionKey`). Can only be called once per receiver — subsequent calls return an error.
 
 **Errors:**
-- `UNSUPPORTED_OPERATION`: SFrame not yet implemented (stub)
-- `INVALID_MODIFICATION`: SFrame already activated on this transceiver
+- `INVALID_MODIFICATION`: SFrame negotiation has already been disabled on this transceiver (SFrame can only be enabled during the initial offer/answer exchange)
 
 ## Internal Architecture
 
-### SframeActivationObserver
+### SframeStateObserver
 
-When `CreateSframeEncrypterOrError` or `CreateSframeDecrypterOrError` is called, the sender/receiver notifies its transceiver via the `SframeActivationObserver` callback. This follows the `SetStreamsObserver` pattern used throughout libwebrtc — a raw pointer to an observer interface, injected via constructor and stored as a `const` member.
+When `CreateSframeEncrypterOrError` or `CreateSframeDecrypterOrError` is called, the sender/receiver notifies its transceiver via the `SframeStateObserver` callback. This follows the `SetStreamsObserver` pattern used throughout libwebrtc — a raw pointer to an observer interface, injected via constructor and stored as a `const` member.
 
 ```mermaid
 classDiagram
-    class SframeActivationObserver {
+    class SframeStateObserver {
         <<interface>>
-        +OnSframeActivated() RTCError
+        +TryEnableSframe() RTCError
     }
 
     class RtpTransceiver {
-        -sframe_activated_: std::optional~bool~
-        +OnSframeActivated() RTCError
+        -sframe enabled state: optional bool
+        +TryEnableSframe() RTCError
     }
 
     class RtpSenderBase {
-        -sframe_activation_observer_: SframeActivationObserver* const
+        -state observer: SframeStateObserver* const
     }
 
     class RtpReceiverBase {
-        -sframe_activation_observer_: SframeActivationObserver* const
+        -state observer: SframeStateObserver* const
     }
 
-    SframeActivationObserver <|.. RtpTransceiver
-    RtpSenderBase --> SframeActivationObserver : notifies
-    RtpReceiverBase --> SframeActivationObserver : notifies
+    SframeStateObserver <|.. RtpTransceiver
+    RtpSenderBase --> SframeStateObserver : notifies
+    RtpReceiverBase --> SframeStateObserver : notifies
 ```
 
 **Transceiver state machine:**
 
-| `sframe_activated_` | Meaning | `OnSframeActivated()` result |
+| SFrame enabled state | Meaning | `TryEnableSframe()` result |
 |---|---|---|
-| `std::nullopt` | Not yet decided | Sets to `true`, returns OK |
-| `true` | Already activated | Returns OK (idempotent) |
+| Not yet decided | SFrame has not been enabled or disabled | Sets to enabled, returns OK |
+| Enabled | SFrame is enabled on this transceiver | Returns OK (idempotent) |
+| Disabled | SFrame was explicitly turned off | Returns `INVALID_MODIFICATION` error |
 
-The transceiver's `sframe_activated_` field is used during SDP generation to determine whether `a=sframe` should be included in the corresponding media section. Once set to `true`, it cannot be reverted.
+The transceiver's SFrame enabled state is used during SDP generation to determine whether `a=sframe` should be included in the corresponding media section. Once enabled, it cannot be reverted. The disabled state is set when an offer/answer exchange completes without SFrame — at that point, SFrame can no longer be enabled on this transceiver.
 
 **Constructor injection:** The observer pointer is passed via constructor to `RtpSenderBase` and `RtpReceiverBase`. The transceiver passes `this` when creating sender/receiver instances through the `CreateSender()` and `CreateReceiver()` helper functions.
 
@@ -193,64 +194,28 @@ The transceiver's `sframe_activated_` field is used during SDP generation to det
 sequenceDiagram
     participant App as Application
     participant Sender as RtpSenderBase
-    participant Observer as SframeActivationObserver (Transceiver)
+    participant Observer as SframeStateObserver (Transceiver)
 
     App->>Sender: CreateSframeEncrypterOrError(options)
-    Sender->>Observer: OnSframeActivated()
-    Observer->>Observer: Check sframe_activated_
+    Sender->>Observer: TryEnableSframe()
+    Observer->>Observer: Check SFrame enabled state
 
-    alt sframe_activated_ == nullopt
-        Observer->>Observer: Set sframe_activated_ = true
+    alt SFrame not yet decided
+        Observer->>Observer: Mark SFrame as enabled
+        Observer->>App: Trigger onnegotiationneeded
         Observer-->>Sender: RTCError::OK()
-    else sframe_activated_ == true
-        Observer-->>Sender: RTCError::OK() (already activated)
+    else SFrame already enabled
+        Observer-->>Sender: RTCError::OK() (idempotent)
     end
 
-    Note over Sender: Create internal transformer
-    Note over Sender: Install transformer in pipeline
+    Note over Sender: Create internal encrypter
+    Note over Sender: Install encrypter in send pipeline
     Sender-->>App: RTCErrorOr<SframeEncrypterInterface> handle
 ```
 
-### Transformation Features Hierarchy
+### SframeEncrypterImpl (Internal)
 
-```mermaid
-classDiagram
-    class TransformationFeatures {
-        <<interface>>
-        +UseSFrame() bool
-        #~TransformationFeatures()
-    }
-    
-    class FrameTransformerInterface {
-        <<interface>>
-        +Transform(frame)
-        +RegisterTransformedFrameCallback(callback)
-        +RegisterTransformedFrameSinkCallback(callback, ssrc)
-        +UnregisterTransformedFrameCallback()
-        +UnregisterTransformedFrameSinkCallback(ssrc)
-        #~FrameTransformerInterface()
-    }
-    
-    class PacketTransformerInterface {
-        <<interface>>
-        +Transform(frame)
-        +GetReservedNumberOfBytes() size_t
-        +RegisterTransformedPacketCallback(callback)
-        +RegisterTransformedPacketSinkCallback(callback, ssrc)
-        +UnregisterTransformedPacketCallback()
-        +UnregisterTransformedPacketSinkCallback(ssrc)
-        #~PacketTransformerInterface()
-    }
-    
-    TransformationFeatures <|-- FrameTransformerInterface
-    TransformationFeatures <|-- PacketTransformerInterface
-```
-
-> **Note**: The `GetReservedNumberOfBytes()` method in `PacketTransformerInterface` ensures that the packetizer reserves enough space for SFrame encryption overhead to avoid MTU overflow.
-
-### SFrameSenderTransformer (Internal)
-
-The `SFrameSenderTransformer` is an internal implementation class created by `RtpSenderBase::CreateSframeEncrypterOrError`. It provides SFrame encryption and exposes both the key management interface (returned to the app via proxy) and transformer interfaces (installed in the pipeline).
+The `SframeEncrypterImpl` is the internal implementation of `SframeEncrypterInterface`, created by `RtpSenderBase::CreateSframeEncrypterOrError`. It provides SFrame encryption and exposes the key management interface (returned to the app via proxy). Internally, it is installed in the send pipeline to encrypt frames or packets depending on the configured mode.
 
 ```mermaid
 classDiagram
@@ -259,26 +224,21 @@ classDiagram
         +SetEncryptionKey(key_id, key_material) RTCError
     }
     
-    class SFrameSenderTransformer {
+    class SframeEncrypterImpl {
         -cipher_suite: SframeCipherSuite
         -sframe_mode: SframeMode
-        +SFrameSenderTransformer(init)
+        +SframeEncrypterImpl(init)
         +SetEncryptionKey(key_id, key_material) RTCError
-        +TransformFrame(frame) TransformedFrame
-        +TransformPacket(packet) TransformedPacket
-        +GetReservedNumberOfBytes() size_t
-        +AsFrameTransformer() FrameTransformerInterface*
-        +AsPacketTransformer() PacketTransformerInterface*
+        +EncryptFrame(frame) EncryptedFrame
+        +EncryptPacket(packet) EncryptedPacket
     }
     
-    SframeEncrypterInterface <|-- SFrameSenderTransformer
+    SframeEncrypterInterface <|-- SframeEncrypterImpl
 ```
 
-> **Diamond Inheritance**: `SFrameSenderTransformer` cannot directly implement both `FrameTransformerInterface` and `PacketTransformerInterface` due to diamond inheritance from the common `TransformationFeatures` base. The factory methods `AsFrameTransformer()` and `AsPacketTransformer()` return separate wrapper objects that implement the respective interfaces and delegate to the transformer.
+### SframeDecrypterImpl (Internal)
 
-### SFrameReceiverTransformer (Internal)
-
-The `SFrameReceiverTransformer` is created by `RtpReceiverBase::CreateSframeDecrypterOrError`. It provides SFrame decryption with the same factory pattern for transformer interfaces.
+The `SframeDecrypterImpl` is the internal implementation of `SframeDecrypterInterface`, created by `RtpReceiverBase::CreateSframeDecrypterOrError`. It provides SFrame decryption and exposes the key management interface (returned to the app via proxy). Internally, it is installed in the receive pipeline to decrypt frames or packets.
 
 ```mermaid
 classDiagram
@@ -288,58 +248,50 @@ classDiagram
         +RemoveDecryptionKey(key_id) RTCError
     }
     
-    class SFrameReceiverTransformer {
+    class SframeDecrypterImpl {
         -cipher_suite: SframeCipherSuite
-        +SFrameReceiverTransformer(init)
+        +SframeDecrypterImpl(init)
         +AddDecryptionKey(key_id, key_material) RTCError
         +RemoveDecryptionKey(key_id) RTCError
-        +TransformFrame(frame) TransformedFrame
-        +TransformPacket(packet) TransformedPacket
-        +GetReservedNumberOfBytes() size_t
-        +AsFrameTransformer() FrameTransformerInterface*
-        +AsPacketTransformer() PacketTransformerInterface*
+        +DecryptFrame(frame) DecryptedFrame
+        +DecryptPacket(packet) DecryptedPacket
     }
     
-    SframeDecrypterInterface <|-- SFrameReceiverTransformer
+    SframeDecrypterInterface <|-- SframeDecrypterImpl
 ```
 
 ### CreateSframeEncrypterOrError Internal Flow
 
 When the application calls `CreateSframeEncrypterOrError`, the sender:
 1. Notifies the transceiver via the observer
-2. Creates the internal `SFrameSenderTransformer`
-3. Based on mode, gets the appropriate transformer wrapper and installs it in the pipeline
-4. Wraps the transformer in a thread-safe proxy
+2. Creates the internal `SframeEncrypterImpl`
+3. Installs the encrypter in the send pipeline
+4. Wraps the encrypter in a thread-safe proxy
 5. Returns the proxy as the key management handle
 
 ```mermaid
 sequenceDiagram
     participant App as Application
     participant Sender as RtpSenderBase
-    participant Observer as SframeActivationObserver
-    participant Transformer as SFrameSenderTransformer
+    participant Observer as SframeStateObserver
+    participant Encrypter as SframeEncrypterImpl
     participant Proxy as SframeEncrypterProxy
     participant Pipeline as Send Pipeline
 
     App->>Sender: CreateSframeEncrypterOrError(options)
 
-    Sender->>Observer: OnSframeActivated()
+    Sender->>Observer: TryEnableSframe()
+    Note over Observer: Mark SFrame as enabled
+    Observer->>App: Trigger onnegotiationneeded
     Observer-->>Sender: RTCError::OK()
 
-    Sender->>Transformer: Create SFrameSenderTransformer(options)
-    Transformer-->>Sender: transformer instance
+    Sender->>Encrypter: Create SframeEncrypterImpl(options)
+    Encrypter-->>Sender: encrypter instance
 
-    alt options.mode == kPerFrame
-        Sender->>Transformer: AsFrameTransformer()
-        Transformer-->>Sender: FrameTransformerInterface*
-        Sender->>Pipeline: SetFrameTransformer(wrapper)
-    else options.mode == kPerPacket
-        Sender->>Transformer: AsPacketTransformer()
-        Transformer-->>Sender: PacketTransformerInterface*
-        Sender->>Pipeline: SetPacketTransformer(wrapper)
-    end
+    Sender->>Pipeline: Install SFrame encrypter
+    Note over Pipeline: Encrypter installed for encryption
 
-    Sender->>Proxy: Wrap transformer as SframeEncrypterProxy
+    Sender->>Proxy: Wrap encrypter as SframeEncrypterProxy
     Note over Proxy: Thread-safe wrapper for key management
 
     Sender-->>App: RTCErrorOr<scoped_refptr<SframeEncrypterInterface>>(proxy)
@@ -351,23 +303,25 @@ sequenceDiagram
 sequenceDiagram
     participant App as Application
     participant Receiver as RtpReceiverBase
-    participant Observer as SframeActivationObserver
-    participant Transformer as SFrameReceiverTransformer
+    participant Observer as SframeStateObserver
+    participant Decrypter as SframeDecrypterImpl
     participant Proxy as SframeDecrypterProxy
     participant Pipeline as Receive Pipeline
 
     App->>Receiver: CreateSframeDecrypterOrError(options)
 
-    Receiver->>Observer: OnSframeActivated()
+    Receiver->>Observer: TryEnableSframe()
+    Note over Observer: Mark SFrame as enabled
+    Observer->>App: Trigger onnegotiationneeded
     Observer-->>Receiver: RTCError::OK()
 
-    Receiver->>Transformer: Create SFrameReceiverTransformer(options)
-    Transformer-->>Receiver: transformer instance
+    Receiver->>Decrypter: Create SframeDecrypterImpl(options)
+    Decrypter-->>Receiver: decrypter instance
 
-    Note over Receiver: Install appropriate transformer in pipeline
-    Receiver->>Pipeline: SetFrameTransformer() or SetPacketTransformer()
+    Receiver->>Pipeline: Install SFrame decrypter
+    Note over Pipeline: Decrypter installed for decryption
 
-    Receiver->>Proxy: Wrap transformer as SframeDecrypterProxy
+    Receiver->>Proxy: Wrap decrypter as SframeDecrypterProxy
     Note over Proxy: Thread-safe wrapper for key management
 
     Receiver-->>App: RTCErrorOr<scoped_refptr<SframeDecrypterInterface>>(proxy)
@@ -379,10 +333,10 @@ sequenceDiagram
 
 Key management calls on the returned `SframeEncrypterInterface` and `SframeDecrypterInterface` handles are thread-safe. The proxy pattern ensures all calls are marshaled to the worker thread:
 
-- **SframeEncrypterProxy**: Wraps `SFrameSenderTransformer`, marshals `SetEncryptionKey` to worker thread
-- **SframeDecrypterProxy**: Wraps `SFrameReceiverTransformer`, marshals `AddDecryptionKey`/`RemoveDecryptionKey` to worker thread
+- **SframeEncrypterProxy**: Wraps `SframeEncrypterImpl`, marshals `SetEncryptionKey` to worker thread
+- **SframeDecrypterProxy**: Wraps `SframeDecrypterImpl`, marshals `AddDecryptionKey`/`RemoveDecryptionKey` to worker thread
 
-The transformer itself always runs on the worker thread, ensuring single-threaded access to encryption/decryption state.
+The encrypter/decrypter itself always runs on the worker thread, ensuring single-threaded access to encryption/decryption state.
 
 ### Sender Key Management Flow
 
@@ -390,21 +344,21 @@ The transformer itself always runs on the worker thread, ensuring single-threade
 sequenceDiagram
     participant App as Application
     participant Proxy as SframeEncrypterProxy (returned handle)
-    participant Transformer as SFrameSenderTransformer
+    participant Encrypter as SframeEncrypterImpl
 
     App->>Proxy: SetEncryptionKey(key_id, key_material)
     
     Note over Proxy: Calling Thread - Post task to worker thread
     Proxy->>Proxy: PostTask to Worker Thread
     
-    Note over Transformer: Worker Thread - Execute key update
-    Proxy->>+Transformer: SetEncryptionKey(key_id, key_material)
-    Transformer-->>-Proxy: RTCError::OK()
+    Note over Encrypter: Worker Thread - Execute key update
+    Proxy->>+Encrypter: SetEncryptionKey(key_id, key_material)
+    Encrypter-->>-Proxy: RTCError::OK()
     
     Note over Proxy: Calling Thread - Return result
     Proxy-->>App: RTCError::OK()
     
-    Note over App,Transformer: ✓ Key is now active for encryption
+    Note over App,Encrypter: ✓ Key is now set for encryption
 ```
 
 ### Receiver Key Management Flow
@@ -413,21 +367,21 @@ sequenceDiagram
 sequenceDiagram
     participant App as Application
     participant Proxy as SframeDecrypterProxy (returned handle)
-    participant Transformer as SFrameReceiverTransformer
+    participant Decrypter as SframeDecrypterImpl
 
     App->>Proxy: AddDecryptionKey(key_id, key_material)
     
     Note over Proxy: Calling Thread - Post task to worker thread
     Proxy->>Proxy: PostTask to Worker Thread
     
-    Note over Transformer: Worker Thread - Execute add key
-    Proxy->>+Transformer: AddDecryptionKey(key_id, key_material)
-    Transformer-->>-Proxy: RTCError::OK()
+    Note over Decrypter: Worker Thread - Execute add key
+    Proxy->>+Decrypter: AddDecryptionKey(key_id, key_material)
+    Decrypter-->>-Proxy: RTCError::OK()
     
     Note over Proxy: Calling Thread - Return result
     Proxy-->>App: RTCError::OK()
     
-    Note over App,Transformer: ✓ New key available for decryption
+    Note over App,Decrypter: ✓ New key available for decryption
     
     Note over App: Later, during key rotation...
     
@@ -436,214 +390,51 @@ sequenceDiagram
     Note over Proxy: Calling Thread - Post task to worker thread
     Proxy->>Proxy: PostTask to Worker Thread
     
-    Note over Transformer: Worker Thread - Execute remove key
-    Proxy->>+Transformer: RemoveDecryptionKey(old_key_id)
-    Transformer-->>-Proxy: RTCError::OK()
+    Note over Decrypter: Worker Thread - Execute remove key
+    Proxy->>+Decrypter: RemoveDecryptionKey(old_key_id)
+    Decrypter-->>-Proxy: RTCError::OK()
     
     Proxy-->>App: RTCError::OK()
     
-    Note over App,Transformer: ✓ Old key removed, only new key remains
-```
-
-## Transformer Installation Flows
-
-These flows show how transformers propagate through the internal layers. In the new API, the sender/receiver calls these internally during `CreateSframeEncrypterOrError` / `CreateSframeDecrypterOrError` — the application does not call `SetFrameTransformer` / `SetPacketTransformer` directly for SFrame.
-
-### RtpSender FrameTransformer Installation Flow
-
-```mermaid
-sequenceDiagram
-    participant App as Application
-    participant Sender as RtpSenderBase
-    participant Passthrough as Internal Layers (Passthrough)
-    participant VideoSender as RTPSenderVideo
-
-    App->>Sender: SetFrameTransformer(transformer)
-    
-    Note over Sender,VideoSender: Propagation through internal layers
-    
-    Sender->>Passthrough: SetFrameTransformer(transformer)
-    Passthrough->>VideoSender: SetFrameTransformer(transformer)
-    
-    Note over VideoSender: Install transformer to FrameTransformerDelegate
-
-    VideoSender-->>Passthrough: return success
-    Passthrough-->>Sender: return success
-    Sender-->>App: return success
-    
-    Note over VideoSender : Frame transformer is now active in media pipeline
-```
-
-### RtpSender PacketTransformer Installation Flow
-
-```mermaid
-sequenceDiagram
-    participant App as Application
-    participant Sender as RtpSenderBase
-    participant Passthrough as Internal Layers (Passthrough)
-    participant VideoSender as RTPSenderVideo
-
-    App->>Sender: SetPacketTransformer(transformer)
-    
-    Note over Sender,VideoSender: Propagation through internal layers
-    
-    Sender->>Passthrough: SetPacketTransformer(transformer)
-    Passthrough->>VideoSender: SetPacketTransformer(transformer)
-    
-    Note over VideoSender: Install transformer in PacketTransformerDelegate
-    
-    VideoSender-->>Passthrough: return success
-    Passthrough-->>Sender: return success
-    Sender-->>App: return success
-    
-    Note over VideoSender: Packet transformer now active in media pipeline
-```
-
-### RtpReceiver(Video) FrameTransformer Installation Flow
-
-```mermaid
-sequenceDiagram
-    participant App as Application
-    participant Receiver as VideoRtpReceiver
-    participant Passthrough as Internal Layers (Passthrough)
-    participant StreamReceiver as RtpVideoStreamReceiver2
-    participant Delegate as RtpVideoStreamReceiverFrameTransformerDelegate
-
-    App->>Receiver: SetFrameTransformer(transformer)
-    
-    Note over Receiver,Delegate: Propagation through receiver stack
-    
-    Receiver->>Passthrough: SetFrameTransformer(transformer)
-    Passthrough->>StreamReceiver: SetFrameTransformer(transformer)
-    
-    Note over StreamReceiver,Delegate: Install transformer to delegate
-    
-    StreamReceiver->>Delegate: SetFrameTransformer(transformer)
-    
-    Note over Delegate: Frame transformer installed and active
-    
-    Delegate-->>StreamReceiver: return success
-    StreamReceiver-->>Passthrough: return success
-    Passthrough-->>Receiver: return success
-    Receiver-->>App: return success
-    
-    Note over Delegate : Frame transformer is now active for decryption
-```
-
-### RtpReceiver(Video) PacketTransformer Installation Flow
-
-```mermaid
-sequenceDiagram
-    participant App as Application
-    participant Receiver as VideoRtpReceiver
-    participant Passthrough as Internal Layers (Passthrough)
-    participant StreamReceiver as RtpVideoStreamReceiver2
-
-    App->>Receiver: SetPacketTransformer(transformer)
-    
-    Note over Receiver,StreamReceiver: Propagation through receiver stack
-    
-    Receiver->>Passthrough: SetPacketTransformer(transformer)
-    Passthrough->>StreamReceiver: SetPacketTransformer(transformer)
-    
-    Note over StreamReceiver: Install transformer in PacketTransformerDelegate
-    
-    StreamReceiver-->>Passthrough: return success
-    Passthrough-->>Receiver: return success
-    Receiver-->>App: return success
-    
-    Note over StreamReceiver: Packet transformer now active for decryption
-```
-
-### RtpReceiver(Audio) FrameTransformer Installation Flow
-
-```mermaid
-sequenceDiagram
-    participant App as Application
-    participant Receiver as AudioRtpReceiver
-    participant Passthrough as Internal Layers (Passthrough)
-    participant ChannelReceive as ChannelReceive
-
-    App->>Receiver: SetFrameTransformer(transformer)
-    
-    Note over Receiver,ChannelReceive: Propagation through receiver stack
-    
-    Receiver->>Passthrough: SetFrameTransformer(transformer)
-    Passthrough->>ChannelReceive: SetDepacketizerToDecoderFrameTransformer(transformer)
-    
-    Note over ChannelReceive: Install transformer for frame processing
-    
-    ChannelReceive-->>Passthrough: return success
-    Passthrough-->>Receiver: return success
-    Receiver-->>App: return success
-    
-    Note over ChannelReceive: Frame transformer now active for audio decryption
-```
-
-### RtpReceiver(Audio) PacketTransformer Installation Flow
-
-```mermaid
-sequenceDiagram
-    participant App as Application
-    participant Receiver as AudioRtpReceiver
-    participant Passthrough as Internal Layers (Passthrough)
-    participant ChannelReceive as ChannelReceive
-
-    App->>Receiver: SetPacketTransformer(transformer)
-    
-    Note over Receiver,ChannelReceive: Propagation through receiver stack
-    
-    Receiver->>Passthrough: SetPacketTransformer(transformer)
-    Passthrough->>ChannelReceive: SetPacketTransformer(transformer)
-    
-    Note over ChannelReceive: Install transformer for packet processing
-    
-    ChannelReceive-->>Passthrough: return success
-    Passthrough-->>Receiver: return success
-    Receiver-->>App: return success
-    
-    Note over ChannelReceive: Packet transformer now active for audio decryption
+    Note over App,Decrypter: ✓ Old key removed, only new key remains
 ```
 
 ## Media Processing Flows
 
 ### RtpSender Frame Processing Flow - Video
 
-This flow describes how encoded video frames are processed through the RTP sender pipeline with SFrame encryption support. The pipeline handles both frame-level and packet-level encryption modes, with appropriate transformers applied at each stage.
+This flow describes how encoded video frames are processed through the RTP sender pipeline with SFrame encryption support. The pipeline handles both frame-level and packet-level encryption modes, with the `SframeEncrypterImpl` invoked directly at the appropriate stage.
 
 **Flow Overview:**
 
 1. **Frame Reception**: The video encoder produces an encoded frame and forwards it to the RTP sender for transmission.
 
 2. **SFrame Configuration Validation**: The sender validates the SFrame configuration:
-   - If SFrame is enabled, it checks whether the appropriate transformer (frame or packet) is available
-   - If SFrame is enabled but no sframe transformer is available, the frame is dropped
-   - If SFrame is not enabled, processing continues normally without SFrame encryption
+   - If SFrame is enabled, it checks whether the `SframeEncrypterImpl` has been installed and has a key set
+   - If SFrame is enabled but the encrypter is not ready, the frame is dropped
+   - If SFrame is not enabled, processing continues normally without encryption
 
-3. **Frame Transformation**: When a frame transformer exists, the encoded frame is forwarded to it:
-   - The frame transformer applies transformation to the frame payload
-   - This occurs before packetization, transforming the complete frame
-   - If no frame transformer exists, this step is skipped
+3. **Frame Encryption** (per-frame mode only): When SFrame per-frame mode is enabled, the `SframeEncrypterImpl` encrypts the complete encoded frame before packetization:
+   - The frame payload is encrypted and the SFrame header is prepended
+   - If SFrame is not enabled or per-packet mode is enabled, this step is skipped
 
-4. **Packetization**: The sender determines the appropriate packetizer based on the frame transformer's `UseSFrame()` method:
-   - If `UseSFrame()` returns true, an SFrame-aware packetizer is used that adds SFrame-specific headers to RTP packets
-   - If `UseSFrame()` returns false (or no frame transformer), a codec-specific packetizer is used for standard RTP packet creation
+4. **Packetization**: The sender determines the appropriate packetizer based on the enabled SFrame mode:
+   - If SFrame per-frame mode is enabled, an SFrame-aware packetizer is used that creates RTP packets with SFrame-specific headers (the frame payload is already encrypted at this point)
+   - If SFrame per-packet mode is enabled or SFrame is not enabled, a codec-specific packetizer is used for standard RTP packet creation
 
-5. **Packet Transformation**: When a packet transformer exists, each RTP packet is individually processed:
-   - Each packet is forwarded to the packet transformer
-   - The transformer applies packet-level transformations
-   - This occurs after packetization, transforming individual packets
-   - If no packet transformer exists, this step is skipped
+5. **Packet Encryption** (per-packet mode only): When SFrame per-packet mode is enabled, the `SframeEncrypterImpl` encrypts each RTP packet individually:
+   - Each packet payload is encrypted and the SFrame header is prepended
+   - This occurs after packetization, encrypting individual packets
+   - If SFrame is not enabled or per-frame mode is enabled, this step is skipped
 
-6. **Repacketization** (when packet transformer with SFrame is used): Additional SFrame-specific headers may be inserted into packets.
+6. **Repacketization** (per-packet mode only): SFrame-specific RTP headers are inserted into the encrypted packets.
 
 ```mermaid
 sequenceDiagram
     participant Encoder as Video Encoder
     participant Sender as RtpSender
-    participant FrameTransformer as Frame Transformer
+    participant Encrypter as SframeEncrypterImpl
     participant Packetizer as Packetizer
-    participant PacketTransformer as Packet Transformer
     participant Network as Network
 
     Encoder->>Sender: 1. EncodedFrame received
@@ -651,100 +442,99 @@ sequenceDiagram
     Note over Sender: STEP 2: Validate SFrame Configuration
 
     alt SFrame Enabled
-        Sender->>Sender: Check transformer availability
-        alt No SFrame Transformer Available
+        Sender->>Sender: Check encrypter availability and key status
+        alt Encrypter not ready
             Sender-->>Encoder: ❌ return (drop frame)
         end
     else SFrame Not Enabled
         Note over Sender: Continue normal processing
     end
     
-    Note over Sender,FrameTransformer: STEP 3: Frame Transformation
+    Note over Sender,Encrypter: STEP 3: Frame Encryption (per-frame mode)
     
-    Sender->>FrameTransformer: Forward frame
-    FrameTransformer->>FrameTransformer: Transform frame
-    FrameTransformer-->>Sender: Transformed frame
+    alt SFrame per-frame mode enabled
+        Sender->>Encrypter: EncryptFrame(frame)
+        Encrypter->>Encrypter: Encrypt payload, prepend SFrame header
+        Encrypter-->>Sender: Encrypted frame
+    else
+        Note over Sender: Skip frame encryption
+    end
     
     Note over Sender,Packetizer: STEP 4: Packetization
     
-    Sender->>FrameTransformer: Call UseSFrame()
-    FrameTransformer-->>Sender: returns if SFrame transformer or not
+    Sender->>Sender: Check SFrame mode
     
-    alt FrameTransformer->UseSFrame() == true
+    alt SFrame per-frame mode enabled
         Note over Sender,Packetizer: Use SFrame-aware packetizer
         
         Sender->>Packetizer: Packetize with SFrame Packetizer
         Packetizer-->>Sender: SFrame RTP packets
-    else FrameTransformer->UseSFrame() == false
+    else SFrame per-packet mode or no SFrame
         Note over Sender,Packetizer: Use codec specific packetizer
         
         Sender->>Packetizer: Codec Specific packetization
         Packetizer-->>Sender: Codec specific RTP packets
     end
     
-    Note over Sender,PacketTransformer: STEP 5: Packet Transformation
+    Note over Sender,Encrypter: STEP 5: Packet Encryption (per-packet mode)
     
-    alt PacketTransformer exists
+    alt SFrame per-packet mode enabled
         loop Each RTP Packet
-            Sender->>PacketTransformer: Forward packet
-            PacketTransformer->>PacketTransformer: Transform packet
-            PacketTransformer-->>Sender: Transformed packet
+            Sender->>Encrypter: EncryptPacket(packet)
+            Encrypter->>Encrypter: Encrypt payload, prepend SFrame header
+            Encrypter-->>Sender: Encrypted packet
         end
 
-        loop
-            Note over Sender: STEP 6: Repacketization
-            alt PacketTransformer->UseSFrame() == true
-                Sender->>Sender: Insert SFrame headers to 
-            end
+        Note over Sender: STEP 6: Repacketization
+        loop Each Encrypted Packet
+            Sender->>Sender: Insert SFrame-specific RTP headers
         end
         
     else
-        Note over Sender: Skip packet transformation
+        Note over Sender: Skip packet encryption
     end
     
     Note over Sender,Network: STEP 7: Network Transmission
-    Sender->>Network: Send encrypted packets
+    Sender->>Network: Send packets
     
     Note over Encoder,Network: ✓ Processing complete - Frame encrypted and sent
 ```
 
 ### RtpReceiver Frame Processing Flow - Video
 
-This flow describes how received RTP packets are processed through the video receiver pipeline with SFrame decryption support. The pipeline handles both packet-level and frame-level decryption modes, reconstructing and decrypting video frames before forwarding them to the decoder.
+This flow describes how received RTP packets are processed through the video receiver pipeline with SFrame decryption support. The pipeline handles both packet-level and frame-level decryption modes, with the `SframeDecrypterImpl` invoked directly at the appropriate stage.
 
 **Flow Overview:**
 
 1. **Packet Reception**: RTP packets arrive from the network transport and are received by the VideoRtpReceiver.
 
 2. **SFrame Configuration Validation**: The receiver validates the SFrame configuration:
-   - If SFrame is enabled, it checks whether the appropriate sframe transformer (packet or frame) is available
-   - If SFrame is enabled but no sframe transformer is available, the packets are dropped
+   - If SFrame is enabled, it checks whether the `SframeDecrypterImpl` has been installed and has keys available
+   - If SFrame is enabled but the decrypter is not ready, the packets are dropped
    - If SFrame is not enabled, processing continues normally without decryption
 
-3. **Pre-repacketization**: When a packet transformer exists, and it implements SFrame (packet_transformer->UseSFrame() return true), it should remove SFrame headers from packets before pushing it to the packet transformer
+3. **SFrame Header Removal** (per-packet mode only): When SFrame per-packet mode is enabled, SFrame-specific RTP headers are stripped from each packet before decryption.
 
-4. **Packet Transformation**: When a packet transformer exists, each received RTP packet is individually processed:
-   - Each packet is forwarded to the packet transformer for transformation
-   - The transformer removes SFrame headers and decrypts the packet payload
+4. **Packet Decryption** (per-packet mode only): When SFrame per-packet mode is enabled, the `SframeDecrypterImpl` decrypts each RTP packet individually:
+   - The SFrame header is parsed and the packet payload is decrypted
    - This occurs before depacketization, working on individual encrypted packets
-   - If no packet transformer exists, this step is skipped
+   - If SFrame is not enabled or per-frame mode is enabled, this step is skipped
 
-5. **Depacketization**: The receiver determines the appropriate depacketizer based on the packet transformer's `UseSFrame()` method:
-   - If `UseSFrame()` returns true, an SFrame depacketizer is used to reconstruct the encrypted frame from SFrame-formatted packets
-   - If `UseSFrame()` returns false (or no packet transformer), a codec-specific depacketizer reconstructs the frame using standard media depacketization
+5. **Depacketization**: The receiver determines the appropriate depacketizer based on the enabled SFrame mode:
+   - If SFrame per-frame mode is enabled, an SFrame depacketizer is used to reconstruct the encrypted frame from SFrame-formatted packets
+   - If SFrame per-packet mode is enabled or SFrame is not enabled, a codec-specific depacketizer reconstructs the frame using standard media depacketization
    - The depacketizer assembles RTP packets into complete video frames
 
-6. **Frame Transformation**: When a frame transformer exists, the assembled frame is processed:
-   - The frame is forwarded to the frame transformer for decryption
-   - The transformer decrypts the complete frame payload
+6. **Frame Decryption** (per-frame mode only): When SFrame per-frame mode is enabled, the `SframeDecrypterImpl` decrypts the complete assembled frame:
+   - The SFrame header is parsed and the frame payload is decrypted
    - This occurs after depacketization, working on the reassembled encrypted frame
-   - If no frame transformer exists, this step is skipped
+   - If SFrame is not enabled or per-packet mode is enabled, this step is skipped
 
 7. **Decoding**: The processed (and potentially decrypted) frame is forwarded to the video decoder for final decoding into displayable video.
 
 The flow supports three operational modes:
-- **Frame Mode**: SFrame depacketizer reconstructs encrypted frame, frame transformer decrypts the complete frame
-- **Packet Mode**: Packet transformer decrypts individual packets, standard depacketizer reconstructs the frame
+- **Per-frame mode**: SFrame depacketizer reconstructs encrypted frame, `SframeDecrypterImpl` decrypts the complete frame
+- **Per-packet mode**: `SframeDecrypterImpl` decrypts individual packets, standard depacketizer reconstructs the frame
 - **No SFrame**: Standard RTP packet reception, depacketization, and decoding without decryption
 
 This receiver flow is the inverse of the sender flow, ensuring that encrypted frames can be properly reconstructed and decrypted regardless of whether frame-level or packet-level encryption was used.
@@ -753,9 +543,8 @@ This receiver flow is the inverse of the sender flow, ensuring that encrypted fr
 sequenceDiagram
     participant Network as Network Transport
     participant Receiver as VideoRtpReceiver
-    participant PacketTransformer as Packet Transformer
+    participant Decrypter as SframeDecrypterImpl
     participant Depacketizer as Depacketizer
-    participant FrameTransformer as Frame Transformer
     participant Decoder as Video Decoder
 
     Network->>Receiver: 1. Receive RTP Packets
@@ -763,64 +552,56 @@ sequenceDiagram
     Note over Receiver: STEP 2: Validate SFrame Configuration
 
     alt SFrame Enabled
-        Receiver->>Receiver: Check transformer availability
-        alt No SFrame Transformer Available
+        Receiver->>Receiver: Check decrypter availability and key status
+        alt Decrypter not ready
             Receiver-->>Network: ❌ return (drop packets)
         end
     else SFrame Not Enabled
         Note over Receiver: Continue normal processing
     end
     
-    Note over Receiver,PacketTransformer: STEP 3: Pre-Transformation SFrame Header Removal
+    Note over Receiver,Decrypter: STEP 3: SFrame Header Removal (per-packet mode)
     
-    alt PacketTransformer exists
-        Receiver->>PacketTransformer: Call UseSFrame()
-        PacketTransformer-->>Receiver: returns if SFrame transformer or not
-        
-        alt PacketTransformer->UseSFrame() == true
-            loop Each RTP Packet
-                Receiver->>Receiver: Remove SFrame headers from packet
-            end
+    alt SFrame per-packet mode enabled
+        loop Each RTP Packet
+            Receiver->>Receiver: Remove SFrame-specific RTP headers
         end
     end
     
-    Note over Receiver,PacketTransformer: STEP 4: Packet Transformation
+    Note over Receiver,Decrypter: STEP 4: Packet Decryption (per-packet mode)
     
-    alt PacketTransformer exists
+    alt SFrame per-packet mode enabled
         loop Each RTP Packet
-            Receiver->>PacketTransformer: Forward packet
-            PacketTransformer->>PacketTransformer: Transform packet
-            PacketTransformer-->>Receiver: Transformed packet
+            Receiver->>Decrypter: DecryptPacket(packet)
+            Decrypter->>Decrypter: Parse SFrame header, decrypt payload
+            Decrypter-->>Receiver: Decrypted packet
         end
     else
-        Note over Receiver: Skip packet transformation
+        Note over Receiver: Skip packet decryption
     end
     
     Note over Receiver,Depacketizer: STEP 5: Depacketization
     
-    Receiver->>PacketTransformer: Call UseSFrame()
-    PacketTransformer-->>Receiver: returns if SFrame transformer or not
-    
-    alt PacketTransformer->UseSFrame() == true
+    alt SFrame per-frame mode enabled
         Note over Receiver,Depacketizer: Use SFrame depacketizer
         
         Receiver->>Depacketizer: Depacketize with SFrame Depacketizer
         Depacketizer-->>Receiver: Assembled SFrame encrypted frame
-    else PacketTransformer->UseSFrame() == false
+    else SFrame per-packet mode or no SFrame
         Note over Receiver,Depacketizer: Use codec specific depacketizer
         
         Receiver->>Depacketizer: Codec Specific depacketization
         Depacketizer-->>Receiver: Assembled codec specific frame
     end
     
-    Note over Receiver,FrameTransformer: STEP 6: Frame Transformation
+    Note over Receiver,Decrypter: STEP 6: Frame Decryption (per-frame mode)
     
-    alt FrameTransformer exists
-        Receiver->>FrameTransformer: Forward frame
-        FrameTransformer->>FrameTransformer: Transform frame
-        FrameTransformer-->>Receiver: Transformed frame
+    alt SFrame per-frame mode enabled
+        Receiver->>Decrypter: DecryptFrame(frame)
+        Decrypter->>Decrypter: Parse SFrame header, decrypt payload
+        Decrypter-->>Receiver: Decrypted frame
     else
-        Note over Receiver: Skip frame transformation
+        Note over Receiver: Skip frame decryption
     end
     
     Note over Receiver,Decoder: STEP 7: Decoding
