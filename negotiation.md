@@ -105,6 +105,7 @@ sequenceDiagram
     AppA->>SA: CreateSframeEncrypterOrError(options)
     SA->>TA: TryEnableSframe() via observer
     Note over TA: SFrame marked as enabled
+    TA-->>SA: RTCError::OK()
     SA-->>AppA: RTCErrorOr<SframeEncrypterInterface> (key handle)
 
     PCA-->>AppA: onnegotiationneeded
@@ -115,6 +116,7 @@ sequenceDiagram
     AppB->>SB: CreateSframeEncrypterOrError(options)
     SB->>TB: TryEnableSframe() via observer
     Note over TB: SFrame marked as enabled
+    TB-->>SB: RTCError::OK()
     SB-->>AppB: RTCErrorOr<SframeEncrypterInterface> (key handle)
 
     Note over AppA,AppB: Offer/Answer Exchange
@@ -165,6 +167,7 @@ sequenceDiagram
     AppA->>SA: CreateSframeEncrypterOrError(options)
     SA->>TA: TryEnableSframe()
     Note over TA: SFrame marked as enabled
+    TA-->>SA: RTCError::OK()
     SA-->>AppA: key handle
     PCA-->>AppA: onnegotiationneeded
 
@@ -270,6 +273,7 @@ sequenceDiagram
     AppA->>SA: CreateSframeEncrypterOrError(options)
     SA->>TA: TryEnableSframe()
     Note over TA: SFrame marked as enabled
+    TA-->>SA: RTCError::OK()
     SA-->>AppA: key handle
 
     AppA->>PCA: CreateOffer()
@@ -336,6 +340,7 @@ sequenceDiagram
     App->>S: CreateSframeEncrypterOrError(options)
     S->>T: TryEnableSframe()
     Note over T: SFrame marked as enabled
+    T-->>S: RTCError::OK()
     S-->>App: RTCErrorOr<SframeEncrypterInterface>
 
     PC-->>App: onnegotiationneeded

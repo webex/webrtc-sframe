@@ -290,9 +290,11 @@ sequenceDiagram
 
     Sender->>Pipeline: Install SFrame encrypter
     Note over Pipeline: Encrypter installed for encryption
+    Pipeline-->>Sender: installed
 
     Sender->>Proxy: Wrap encrypter as SframeEncrypterProxy
     Note over Proxy: Thread-safe wrapper for key management
+    Proxy-->>Sender: proxy instance
 
     Sender-->>App: RTCErrorOr<scoped_refptr<SframeEncrypterInterface>>(proxy)
 ```
@@ -320,9 +322,11 @@ sequenceDiagram
 
     Receiver->>Pipeline: Install SFrame decrypter
     Note over Pipeline: Decrypter installed for decryption
+    Pipeline-->>Receiver: installed
 
     Receiver->>Proxy: Wrap decrypter as SframeDecrypterProxy
     Note over Proxy: Thread-safe wrapper for key management
+    Proxy-->>Receiver: proxy instance
 
     Receiver-->>App: RTCErrorOr<scoped_refptr<SframeDecrypterInterface>>(proxy)
 ```
