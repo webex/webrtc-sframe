@@ -18,41 +18,43 @@ sequenceDiagram
     participant T as RtpTransceiver
     participant S as RtpSender
     participant R as RtpReceiver
+    participant SendPipeline as Send Pipeline
+    participant RecvPipeline as Receive Pipeline
     participant EncHandle as Encrypter Handle
     participant DecHandle as Decrypter Handle
 
     Note over App,DecHandle: SFrame Enablement Flow
 
     App->>S: CreateSframeEncrypterOrError(options)
-    Note over S: Creates internal SFrame encrypter<br/>Installs encrypter in send pipeline
-    S->>T: Notify SFrame enabled via observer
-    Note over T: Marks SFrame as enabled
-    T-->>S: RTCError::OK()
-    S-->>App: Encrypter handle (or error)
-    App->>EncHandle: Store key management handle
+    S->>T: TryToEnableSframe()
+    T-->>S: OK
+    Note over S: Create SframeEncrypterImpl
+    S->>SendPipeline: Install encrypter (worker thread)
+    S-->>App: Return key management handle
+    App->>EncHandle: Store handle
 
     App->>R: CreateSframeDecrypterOrError(options)
-    Note over R: Creates internal SFrame decrypter<br/>Installs decrypter in receive pipeline
-    R->>T: Notify SFrame enabled via observer
-    Note over T: Already enabled, returns OK
-    T-->>R: RTCError::OK()
-    R-->>App: Decrypter handle (or error)
-    App->>DecHandle: Store key management handle
+    R->>T: TryToEnableSframe()
+    T-->>R: OK (already enabled)
+    Note over R: Create SframeDecrypterImpl
+    R->>RecvPipeline: Install decrypter (worker thread)
+    R-->>App: Return key management handle
+    App->>DecHandle: Store handle
 
     Note over T: Triggers onnegotiationneeded
     T->>App: onnegotiationneeded event
 
     Note over App: Offer/answer exchange includes a=sframe
 
-    Note over App,DecHandle: Key Management
+    Note over App,DecHandle: Key Management (via handles)
 
-    App->>EncHandle: Set encryption key
-    Note over EncHandle: Encryption key set on worker thread
+    App->>EncHandle: SetEncryptionKey(key_id, material)
+    EncHandle->>SendPipeline: Key applied (worker thread)
 
-    App->>DecHandle: Add decryption key
-    Note over DecHandle: Decryption key added on worker thread
+    App->>DecHandle: AddDecryptionKey(key_id, material)
+    DecHandle->>RecvPipeline: Key applied (worker thread)
 
-    Note over App,DecHandle: ✓ SFrame encryption/decryption enabled in media pipeline
+    Note over SendPipeline,RecvPipeline: ✓ Encryption/decryption active in media pipeline
 ```
 
 ## Public API
@@ -149,38 +151,38 @@ Creates an internal SFrame decrypter, installs it in the receive pipeline, notif
 
 ## Internal Architecture
 
-### SframeStateObserver
+### SframeEnablementDelegate
 
-When `CreateSframeEncrypterOrError` or `CreateSframeDecrypterOrError` is called, the sender/receiver notifies its transceiver via the `SframeStateObserver` callback. This follows the `SetStreamsObserver` pattern used throughout libwebrtc — a raw pointer to an observer interface, injected via constructor and stored as a `const` member.
+When `CreateSframeEncrypterOrError` or `CreateSframeDecrypterOrError` is called, the sender/receiver notifies its transceiver via the `SframeEnablementDelegate` callback. This follows the `SetStreamsObserver` pattern used throughout libwebrtc — a raw pointer to an observer interface, injected via constructor and stored as a `const` member.
 
 ```mermaid
 classDiagram
-    class SframeStateObserver {
+    class SframeEnablementDelegate {
         <<interface>>
-        +TryEnableSframe() RTCError
+        +TryToEnableSframe() RTCError
     }
 
     class RtpTransceiver {
         -sframe enabled state: optional bool
-        +TryEnableSframe() RTCError
+        +TryToEnableSframe() RTCError
     }
 
     class RtpSenderBase {
-        -state observer: SframeStateObserver* const
+        -state observer: SframeEnablementDelegate* const
     }
 
     class RtpReceiverBase {
-        -state observer: SframeStateObserver* const
+        -state observer: SframeEnablementDelegate* const
     }
 
-    SframeStateObserver <|.. RtpTransceiver
-    RtpSenderBase --> SframeStateObserver : notifies
-    RtpReceiverBase --> SframeStateObserver : notifies
+    SframeEnablementDelegate <|.. RtpTransceiver
+    RtpSenderBase --> SframeEnablementDelegate : notifies
+    RtpReceiverBase --> SframeEnablementDelegate : notifies
 ```
 
 **Transceiver state machine:**
 
-| SFrame enabled state | Meaning | `TryEnableSframe()` result |
+| SFrame enabled state | Meaning | `TryToEnableSframe()` result |
 |---|---|---|
 | Not yet decided | SFrame has not been enabled or disabled | Sets to enabled, returns OK |
 | Enabled | SFrame is enabled on this transceiver | Returns OK (idempotent) |
@@ -194,10 +196,10 @@ The transceiver's SFrame enabled state is used during SDP generation to determin
 sequenceDiagram
     participant App as Application
     participant Sender as RtpSenderBase
-    participant Observer as SframeStateObserver (Transceiver)
+    participant Observer as SframeEnablementDelegate (Transceiver)
 
     App->>Sender: CreateSframeEncrypterOrError(options)
-    Sender->>Observer: TryEnableSframe()
+    Sender->>Observer: TryToEnableSframe()
     Observer->>Observer: Check SFrame enabled state
 
     alt SFrame not yet decided
@@ -273,14 +275,14 @@ When the application calls `CreateSframeEncrypterOrError`, the sender:
 sequenceDiagram
     participant App as Application
     participant Sender as RtpSenderBase
-    participant Observer as SframeStateObserver
+    participant Observer as SframeEnablementDelegate
     participant Encrypter as SframeEncrypterImpl
     participant Proxy as SframeEncrypterProxy
     participant Pipeline as Send Pipeline
 
     App->>Sender: CreateSframeEncrypterOrError(options)
 
-    Sender->>Observer: TryEnableSframe()
+    Sender->>Observer: TryToEnableSframe()
     Note over Observer: Mark SFrame as enabled
     Observer->>App: Trigger onnegotiationneeded
     Observer-->>Sender: RTCError::OK()
@@ -305,14 +307,14 @@ sequenceDiagram
 sequenceDiagram
     participant App as Application
     participant Receiver as RtpReceiverBase
-    participant Observer as SframeStateObserver
+    participant Observer as SframeEnablementDelegate
     participant Decrypter as SframeDecrypterImpl
     participant Proxy as SframeDecrypterProxy
     participant Pipeline as Receive Pipeline
 
     App->>Receiver: CreateSframeDecrypterOrError(options)
 
-    Receiver->>Observer: TryEnableSframe()
+    Receiver->>Observer: TryToEnableSframe()
     Note over Observer: Mark SFrame as enabled
     Observer->>App: Trigger onnegotiationneeded
     Observer-->>Receiver: RTCError::OK()
@@ -330,6 +332,165 @@ sequenceDiagram
 
     Receiver-->>App: RTCErrorOr<scoped_refptr<SframeDecrypterInterface>>(proxy)
 ```
+
+## Encrypter/Decrypter Propagation
+
+This section describes how the internally created `SframeEncrypterImpl` and `SframeDecrypterImpl` are propagated from the RtpSender/RtpReceiver down to the actual media pipeline actors that perform encryption and decryption.
+
+### Design Principle
+
+The application never sees or touches the internal encrypter/decrypter implementation. Instead:
+
+1. **RtpSender/RtpReceiver creates** the internal `SframeEncrypterImpl`/`SframeDecrypterImpl`
+2. **RtpSender/RtpReceiver installs** it into the media send/receive pipeline on the worker thread
+3. **RtpSender/RtpReceiver returns** a key management handle (the `SframeEncrypterInterface`/`SframeDecrypterInterface` ref-counted proxy) to the application
+
+The application only interacts with the handle for key management. The actual encryption/decryption happens internally in the media pipeline, invisible to the caller.
+
+### Encrypter Propagation (RtpSender → Send Pipeline)
+
+When `CreateSframeEncrypterOrError` is called on the RtpSender, the encrypter is created and pushed down to the send channel where it intercepts frames or packets depending on the configured mode.
+
+```mermaid
+flowchart TD
+    subgraph API Layer
+        App[Application]
+        SenderAPI[RtpSender]
+    end
+
+    subgraph Internal - Signaling Thread
+        SenderAPI -->|1. CreateSframeEncrypterOrError| Create[Create SframeEncrypterImpl]
+        Create -->|2. Notify| Delegate[SframeEnablementDelegate\nRtpTransceiver]
+    end
+
+    subgraph Internal - Worker Thread
+        Create -->|3. BlockingCall| Install[Install encrypter into\nMediaSendChannel]
+        Install --> SendChannel[MediaSendChannelInterface]
+
+        subgraph Video Path
+            SendChannel --> VSS[VideoSendStream]
+            VSS --> VEncoder[Video Encoder]
+            VEncoder -->|Encoded frame| EncryptPoint_V[SframeEncrypterImpl\nEncrypt frame/packet]
+            EncryptPoint_V --> Packetizer[Packetizer]
+            Packetizer --> Network_V[Network]
+        end
+
+        subgraph Audio Path
+            SendChannel --> ASS[AudioSendStream]
+            ASS --> AEncoder[Audio Encoder]
+            AEncoder -->|Encoded frame| EncryptPoint_A[SframeEncrypterImpl\nEncrypt frame/packet]
+            EncryptPoint_A --> RtpPacketizer[RTP Packetizer]
+            RtpPacketizer --> Network_A[Network]
+        end
+    end
+
+    subgraph Returned to App
+        Create -->|4. Return handle| Handle[SframeEncrypterInterface\nkey management proxy]
+        Handle -->|SetEncryptionKey| EncryptPoint_V
+        Handle -->|SetEncryptionKey| EncryptPoint_A
+    end
+
+    App -->|Calls| SenderAPI
+    App -->|Uses handle for keys| Handle
+
+    style EncryptPoint_V fill:#f96,stroke:#333
+    style EncryptPoint_A fill:#f96,stroke:#333
+    style Handle fill:#6f9,stroke:#333
+```
+
+**Step-by-step:**
+
+| Step | Thread | Action |
+|------|--------|--------|
+| 1 | Signaling | App calls `sender->CreateSframeEncrypterOrError(init)` |
+| 2 | Signaling | RtpSender notifies transceiver via `SframeEnablementDelegate::TryToEnableSframe()` |
+| 3 | Worker (BlockingCall) | RtpSender creates `SframeEncrypterImpl` and installs it into the `MediaSendChannelInterface` |
+| 4 | Signaling | RtpSender wraps the impl in a thread-safe proxy and returns the handle to the app |
+
+After installation, the `SframeEncrypterImpl` lives on the worker thread and is invoked by the send pipeline at the appropriate point (before packetization for per-frame mode, after packetization for per-packet mode). The application only interacts with it through the returned proxy handle for key management.
+
+### Decrypter Propagation (RtpReceiver → Receive Pipeline)
+
+When `CreateSframeDecrypterOrError` is called on the RtpReceiver, the decrypter is created and pushed down to the receive channel where it intercepts packets or frames depending on the mode signaled in the SFrame header.
+
+```mermaid
+flowchart TD
+    subgraph API Layer
+        App[Application]
+        ReceiverAPI[RtpReceiver]
+    end
+
+    subgraph Internal - Signaling Thread
+        ReceiverAPI -->|1. CreateSframeDecrypterOrError| Create[Create SframeDecrypterImpl]
+        Create -->|2. Notify| Delegate[SframeEnablementDelegate\nRtpTransceiver]
+    end
+
+    subgraph Internal - Worker Thread
+        Create -->|3. BlockingCall| Install[Install decrypter into\nMediaReceiveChannel]
+        Install --> RecvChannel[MediaReceiveChannelInterface]
+
+        subgraph Video Path
+            Network_V[Network] --> VRS[VideoReceiveStream]
+            VRS -->|RTP packets| DecryptPoint_V[SframeDecrypterImpl\nDecrypt packet/frame]
+            DecryptPoint_V --> Depacketizer[Depacketizer]
+            Depacketizer --> VDecoder[Video Decoder]
+        end
+
+        subgraph Audio Path
+            Network_A[Network] --> ARS[AudioReceiveStream]
+            ARS -->|RTP packets| DecryptPoint_A[SframeDecrypterImpl\nDecrypt packet/frame]
+            DecryptPoint_A --> AudioDepacketizer[Audio Depacketizer]
+            AudioDepacketizer --> ADecoder[Audio Decoder]
+        end
+    end
+
+    subgraph Returned to App
+        Create -->|4. Return handle| Handle[SframeDecrypterInterface\nkey management proxy]
+        Handle -->|AddDecryptionKey\nRemoveDecryptionKey| DecryptPoint_V
+        Handle -->|AddDecryptionKey\nRemoveDecryptionKey| DecryptPoint_A
+    end
+
+    App -->|Calls| ReceiverAPI
+    App -->|Uses handle for keys| Handle
+
+    style DecryptPoint_V fill:#69f,stroke:#333
+    style DecryptPoint_A fill:#69f,stroke:#333
+    style Handle fill:#6f9,stroke:#333
+```
+
+**Step-by-step:**
+
+| Step | Thread | Action |
+|------|--------|--------|
+| 1 | Signaling | App calls `receiver->CreateSframeDecrypterOrError(init)` |
+| 2 | Signaling | RtpReceiver notifies transceiver via `SframeEnablementDelegate::TryToEnableSframe()` |
+| 3 | Worker (BlockingCall) | RtpReceiver creates `SframeDecrypterImpl` and installs it into the `MediaReceiveChannelInterface` |
+| 4 | Signaling | RtpReceiver wraps the impl in a thread-safe proxy and returns the handle to the app |
+
+After installation, the `SframeDecrypterImpl` lives on the worker thread and is invoked by the receive pipeline at the appropriate point (before depacketization for per-packet mode, after depacketization for per-frame mode). The application only interacts with it through the returned proxy handle for key management.
+
+### Ownership Model
+
+```mermaid
+flowchart LR
+    subgraph Ownership
+        direction TB
+        Impl[SframeEncrypterImpl / SframeDecrypterImpl\nscoped_refptr - shared ownership]
+        Pipeline[MediaSendChannel / MediaReceiveChannel\nholds scoped_refptr]
+        Proxy[Proxy returned to App\nholds scoped_refptr]
+    end
+
+    Impl --- Pipeline
+    Impl --- Proxy
+
+    style Impl fill:#ffd,stroke:#333
+```
+
+The internal impl is ref-counted (`RefCountInterface`). Two parties hold references:
+- **The media channel** (worker thread) — uses the impl for actual encryption/decryption
+- **The proxy handle** (returned to the app) — uses the impl for key management calls, marshaled to the worker thread
+
+This ensures the impl stays alive as long as either the pipeline or the application needs it. When both release their references, the impl is destroyed.
 
 ## Key Management
 

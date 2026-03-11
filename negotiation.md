@@ -23,14 +23,14 @@ This means:
 
 | Layer | Description |
 |-------|-------------|
-| **Application API** | `RtpSenderInterface::CreateSframeEncrypterOrError()` / `RtpReceiverInterface::CreateSframeDecrypterOrError()` — enables SFrame on the sender/receiver, which internally notifies the transceiver via `SframeStateObserver` |
+| **Application API** | `RtpSenderInterface::CreateSframeEncrypterOrError()` / `RtpReceiverInterface::CreateSframeDecrypterOrError()` — enables SFrame on the sender/receiver, which internally notifies the transceiver via `SframeEnablementDelegate` |
 | **Transceiver State** | Each transceiver tracks an SFrame enabled state (not yet decided / enabled / disabled) — set to enabled when the observer callback fires, drives SDP generation |
 | **Offer/Answer** | SFrame preference is carried per media section during offer/answer creation |
 | **SDP Wire Format** | `a=sframe` attribute line present in the m= section when SFrame is enabled |
 
 ## SFrame Negotiation Rules
 
-1. **Opt-in only**: SFrame is disabled by default. The application must call `CreateSframeEncrypterOrError()` on the sender and/or `CreateSframeDecrypterOrError()` on the receiver to enable it. These calls internally notify the transceiver via the `SframeStateObserver` callback.
+1. **Opt-in only**: SFrame is disabled by default. The application must call `CreateSframeEncrypterOrError()` on the sender and/or `CreateSframeDecrypterOrError()` on the receiver to enable it. These calls internally notify the transceiver via the `SframeEnablementDelegate` callback.
 2. **No downgrade**: Once SFrame has been enabled on a transceiver (via the observer callback), the SFrame enabled state is permanent. Calling `CreateSframeEncrypterOrError`/`CreateSframeDecrypterOrError` again returns `INVALID_MODIFICATION` if the transceiver has already completed negotiation without SFrame.
 3. **Offers are never rejected for `a=sframe`**: Per the standard O/A model, the answerer accepts the offer and answers honestly — omitting `a=sframe` if it doesn't support SFrame.
 4. **Answers cannot introduce `a=sframe`**: If the offer did not include `a=sframe` for a media section, the answer must not add it. This is an RFC 3264 constraint — the answer is bounded by the offer. The SDP factory ensures answers only include `a=sframe` when both the offer and local preferences agree, and malicious answers that violate this are rejected.
@@ -103,7 +103,7 @@ sequenceDiagram
     PCA-->>AppA: transceiver A (with sender A, receiver A)
 
     AppA->>SA: CreateSframeEncrypterOrError(options)
-    SA->>TA: TryEnableSframe() via observer
+    SA->>TA: TryToEnableSframe() via observer
     Note over TA: SFrame marked as enabled
     TA-->>SA: RTCError::OK()
     SA-->>AppA: RTCErrorOr<SframeEncrypterInterface> (key handle)
@@ -114,7 +114,7 @@ sequenceDiagram
     PCB-->>AppB: transceiver B (matchable per JSEP §5.10)
 
     AppB->>SB: CreateSframeEncrypterOrError(options)
-    SB->>TB: TryEnableSframe() via observer
+    SB->>TB: TryToEnableSframe() via observer
     Note over TB: SFrame marked as enabled
     TB-->>SB: RTCError::OK()
     SB-->>AppB: RTCErrorOr<SframeEncrypterInterface> (key handle)
@@ -165,7 +165,7 @@ sequenceDiagram
     PCA-->>AppA: transceiver A
 
     AppA->>SA: CreateSframeEncrypterOrError(options)
-    SA->>TA: TryEnableSframe()
+    SA->>TA: TryToEnableSframe()
     Note over TA: SFrame marked as enabled
     TA-->>SA: RTCError::OK()
     SA-->>AppA: key handle
@@ -271,7 +271,7 @@ sequenceDiagram
     PCA-->>AppA: transceiver A
 
     AppA->>SA: CreateSframeEncrypterOrError(options)
-    SA->>TA: TryEnableSframe()
+    SA->>TA: TryToEnableSframe()
     Note over TA: SFrame marked as enabled
     TA-->>SA: RTCError::OK()
     SA-->>AppA: key handle
@@ -338,7 +338,7 @@ sequenceDiagram
     Note over App,T: Initial state: SFrame not enabled, media flowing
 
     App->>S: CreateSframeEncrypterOrError(options)
-    S->>T: TryEnableSframe()
+    S->>T: TryToEnableSframe()
     Note over T: SFrame marked as enabled
     T-->>S: RTCError::OK()
     S-->>App: RTCErrorOr<SframeEncrypterInterface>
@@ -380,7 +380,7 @@ sequenceDiagram
     Note over App,T: Later, application tries to enable SFrame...
 
     App->>S: CreateSframeEncrypterOrError(options)
-    S->>T: TryEnableSframe()
+    S->>T: TryToEnableSframe()
     T-->>S: ❌ INVALID_MODIFICATION
     S-->>App: RTCError(INVALID_MODIFICATION)
     Note over App: "Cannot enable SFrame after<br/>negotiation completed without it"
