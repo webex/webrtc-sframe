@@ -25,6 +25,39 @@ dedicated packet buffer reassembles `S→E` runs, and decryption is then
 dispatched per-packet (T=1) or per-frame (T=0).  Everything downstream of
 that intercept is unchanged.
 
+Three lanes meet at `OnReceivedPayloadData` and again at
+`OnAssembledFrame`: the existing non-SFrame path, the T=1 per-packet
+path (decrypt then rejoin the codec depacketizer), and the T=0 per-frame
+path (raw depacketize, tag the header, decrypt after assembly).
+
+```mermaid
+flowchart TD
+    A[RTP packet] --> B[ReceivePacket]
+
+    B -->|SFrame off| Plain[Codec depacketizer<br/>parse_and_insert]
+    B -->|SFrame on| SF[RtpDepacketizerSframe<br/>parse + strip descriptor]
+
+    SF --> SPB[SFramePacketBuffer<br/>validate S→E run]
+    SPB -->|incomplete| Wait((wait))
+    SPB -->|overflow| KF[RequestKeyFrame]
+    SPB -->|complete run| TBit{T-bit?}
+
+    TBit -->|T=1 per-packet| Dec1[SframeDecrypter<br/>decrypt each packet]
+    Dec1 --> Plain
+
+    TBit -->|T=0 per-frame| Raw[VideoRtpDepacketizerRaw<br/>tag sframe_encrypted=true]
+
+    Plain --> OP[OnReceivedPayloadData]
+    Raw --> OP
+    OP --> PB[PacketBuffer::InsertPacket]
+    PB --> OI[OnInsertedPacket<br/>assemble frame]
+    OI --> OA[OnAssembledFrame]
+
+    OA -->|sframe_encrypted| Dec0[SframeDecrypter<br/>decrypt frame]
+    OA -->|cleartext| Down[reference finder → decode]
+    Dec0 --> Down
+```
+
 ---
 
 ## Components at a Glance
@@ -51,19 +84,20 @@ ReceivePacket
   │
   └─ [SFrame enabled]
        │
-       │  1. sframe_depacketizer_->Parse(packet)
+       │  1. RtpDepacketizerSframe::Parse(packet)
        │       → SframeRtpPacketReceived(packet, {S, E, T})
        │
-       │  2. sframe_packet_buffer_->InsertPacket(sframe_pkt)
-       │     if (result.buffer_cleared) RequestKeyFrame();
-       │     if (result.packets.empty()) return;   // incomplete frame
+       │  2. sframe_packet_buffer_.InsertPacket(sframe_pkt)
+       │     → std::variant<AssembledFrame, InsertResult>
+       │     if (kBufferCleared) RequestKeyFrame();
+       │     if (kNoFrame)        return;            // incomplete frame
        │
-       │  3. Branch on T-bit
+       │  3. Branch on assembled.encryption_level (from T-bit)
        │
-       ├─ T=1 (per-packet): decrypt each packet → parse_and_insert()
+       ├─ kPacket (T=1, per-packet): decrypt each packet → parse_and_insert()
        │    (normal codec depacketizer → PacketBuffer → OnInsertedPacket)
        │
-       └─ T=0 (per-frame): raw depacketizer → OnReceivedPayloadData
+       └─ kFrame  (T=0, per-frame):  raw depacketizer → OnReceivedPayloadData
             (PacketBuffer → OnInsertedPacket → OnAssembledFrame → decrypt)
 ```
 
@@ -76,24 +110,27 @@ ReceivePacket
 
 2. **Insert into `SFramePacketBuffer`** — the buffer collects packets and
    validates complete S→E runs (contiguous sequence of packets from
-   start-of-frame to end-of-frame).  If the run is incomplete, buffer the
-   packet and wait.  If the buffer overflows, clear it and request a
-   keyframe.
+   start-of-frame to end-of-frame).  `InsertPacket` returns a
+   `std::variant<AssembledFrame, InsertResult>`: an `AssembledFrame`
+   carries the validated run and its `encryption_level`; otherwise the
+   `InsertResult` enum is `kNoFrame` (still buffering) or
+   `kBufferCleared` (overflow — caller requests a keyframe).
 
-3. **Branch on the T-bit** — once a complete S→E run is available:
-   - **T=1 (per-packet):** each packet's payload is individually encrypted.
-     Decrypt each packet first, then feed the cleartext through the normal
-     codec depacketizer path.  From this point on, the pipeline is
-     identical to the non-SFrame flow.
-   - **T=0 (per-frame):** the entire frame is encrypted as one unit, split
-     across packets.  The individual packet payloads are opaque ciphertext
-     that the codec depacketizer cannot parse.  Instead, use a raw
-     depacketizer to pass them through `OnReceivedPayloadData` →
-     `PacketBuffer` → `OnInsertedPacket`, where they are reassembled into
-     a single bitstream.  Frame-level decryption happens at
-     `OnAssembledFrame` after assembly (see [T=0 Decryption
-     Signal](#t0-decryption-signal) below for how the signal reaches
-     that point).
+3. **Branch on `encryption_level`** — once a complete S→E run is
+   available the buffer reports `kPacket` (T=1) or `kFrame` (T=0):
+   - **`kPacket` (T=1, per-packet):** each packet's payload is
+     individually encrypted.  Decrypt each packet first, then feed the
+     cleartext through the normal codec depacketizer path.  From this
+     point on, the pipeline is identical to the non-SFrame flow.
+   - **`kFrame` (T=0, per-frame):** the entire frame is encrypted as one
+     unit, split across packets.  The individual packet payloads are
+     opaque ciphertext that the codec depacketizer cannot parse.
+     Instead, use a raw depacketizer to pass them through
+     `OnReceivedPayloadData` → `PacketBuffer` → `OnInsertedPacket`,
+     where they are reassembled into a single bitstream.  Frame-level
+     decryption happens at `OnAssembledFrame` after assembly (see [T=0
+     Decryption Signal](#t0-decryption-signal) below for how the signal
+     reaches that point).
 
 `SframeRtpPacketReceived` is scoped to the intercept block: it carries
 the parsed S/E/T descriptor into `SFramePacketBuffer` and is unwrapped
@@ -109,29 +146,26 @@ problem: by the time the bitstream reaches `OnAssembledFrame` it looks
 like a normal reassembled frame, and we need a way to tell that method
 “this one is ciphertext, decrypt it before releasing it downstream.”
 
-We thread a `bool sframe_per_frame_decrypt = false` parameter through
-`OnReceivedPayloadData` → `OnInsertedPacket` → `OnAssembledFrame`.
-The T=0 path passes `true`; everywhere else the default `false` keeps
-existing call sites unchanged.  Decryption happens at `OnAssembledFrame`
-when the flag is set.
+We piggyback on `RTPVideoHeader`: add a `bool sframe_encrypted = false`
+field that travels with the packet through `OnReceivedPayloadData` →
+`PacketBuffer` → `OnInsertedPacket` → `OnAssembledFrame`.  The T=0 path
+sets the flag when stamping the parsed header; the decryption decision
+is made at `OnAssembledFrame` by checking
+`frame->GetRtpVideoHeader().sframe_encrypted`.  No method signatures
+change — the tag rides along inside the `RTPVideoHeader` already passed
+through the pipeline.
 
-### Signature changes
+### New field
 
 ```cpp
-// rtp_video_stream_receiver2.h
-bool OnReceivedPayloadData(CopyOnWriteBuffer codec_payload,
-                           const RtpPacketReceived& rtp_packet,
-                           const RTPVideoHeader& video,
-                           int times_nacked,
-                           bool sframe_per_frame_decrypt = false);
+// modules/rtp_rtcp/source/rtp_video_header.h
+struct RTPVideoHeader {
+  // ... existing fields ...
 
-void OnInsertedPacket(video_coding::PacketBuffer::InsertResult result,
-                      bool sframe_per_frame_decrypt = false)
-    RTC_RUN_ON(packet_sequence_checker_);
-
-void OnAssembledFrame(std::unique_ptr<RtpFrameObject> frame,
-                      bool sframe_per_frame_decrypt = false)
-    RTC_RUN_ON(packet_sequence_checker_);
+  // True when the payload is SFrame ciphertext (T=0 per-frame mode).
+  // Tells OnAssembledFrame to route through SFrame decryption.
+  bool sframe_encrypted = false;
+};
 ```
 
 ### Step-by-step (T=0)
@@ -139,57 +173,19 @@ void OnAssembledFrame(std::unique_ptr<RtpFrameObject> frame,
 1. **Raw depacketize** — for each packet in the completed S→E run, use
    `VideoRtpDepacketizerRaw` to pass the opaque ciphertext payload through
    without codec parsing.
-2. **Call `OnReceivedPayloadData` with `sframe_per_frame_decrypt=true`** —
-   the bool is explicitly passed as the last argument.
-3. **`OnReceivedPayloadData` → `PacketBuffer::InsertPacket`** — packets
-   enter `PacketBuffer` as usual.  The bool is forwarded to
-   `OnInsertedPacket`.
+2. **Tag `video_header.sframe_encrypted = true`** — stamp the parsed
+   `RTPVideoHeader` before it enters the pipeline.  No extra parameters.
+3. **`OnReceivedPayloadData` → `PacketBuffer::InsertPacket`** — the
+   `RTPVideoHeader` (with the tag) is stored alongside the packet in
+   `PacketBuffer`.
 4. **`OnInsertedPacket` → `OnAssembledFrame`** — once `PacketBuffer`
-   assembles a complete frame, forward the bool to `OnAssembledFrame`.
-5. **`OnAssembledFrame`** — check the bool: if `true`, decrypt the frame
-   via `sframe_decrypter_->DecryptFrame()`.  After decryption the
-   cleartext frame continues through the remaining pipeline
+   assembles a complete frame, `RtpFrameObject` carries the tagged
+   `RTPVideoHeader`.
+5. **`OnAssembledFrame`** — check
+   `frame->GetRtpVideoHeader().sframe_encrypted`: if `true`, decrypt
+   the frame via `sframe_decrypter_->DecryptFrame()`.  After decryption
+   the cleartext frame continues through the remaining pipeline
    (`frame_transformer_delegate_` → `OnCompleteFrames`).
-
-### SFrame intercept (T=0 path)
-
-```cpp
-// T=0: payloads are opaque ciphertext → raw depacketizer.
-for (auto& pkt : result.packets) {
-  auto parsed = raw_depacketizer.Parse(pkt.PayloadBuffer());
-  int times_nacked = nack_module_
-      ? nack_module_->OnReceivedPacket(pkt.SequenceNumber(), pkt.recovered())
-      : -1;
-  OnReceivedPayloadData(std::move(parsed->video_payload),
-                        pkt, parsed->video_header, times_nacked,
-                        /*sframe_per_frame_decrypt=*/true);
-}
-```
-
-### Decryption point (in `OnAssembledFrame`)
-
-The `else if` chain is the existing decrypt/transform decision — we only
-add the new branch at the top.
-
-```cpp
-if (sframe_per_frame_decrypt) {
-  // Decrypt, then continue through the remaining pipeline.
-  auto decrypted = sframe_decrypter_->DecryptFrame(std::move(frame));
-  if (frame_transformer_delegate_) {
-    frame_transformer_delegate_->TransformFrame(std::move(decrypted));
-  } else {
-    OnCompleteFrames(reference_finder_->ManageFrame(std::move(decrypted)));
-  }
-} else if (buffered_frame_decryptor_ != nullptr) {
-  buffered_frame_decryptor_->ManageEncryptedFrame(std::move(frame));
-} else if (frame_transformer_delegate_) {
-  frame_transformer_delegate_->TransformFrame(std::move(frame));
-} else {
-  OnCompleteFrames(reference_finder_->ManageFrame(std::move(frame)));
-}
-```
-
----
 
 ## Component Details
 
@@ -211,16 +207,18 @@ without re-parsing.  Does not propagate past the SFrame intercept block.
 
 ### `RtpDepacketizerSframe`
 
-Codec-agnostic depacketizer for the SFrame payload descriptor:
+Codec-agnostic depacketizer for the SFrame payload descriptor.  Exposes
+a single static `Parse(RtpPacketReceived)` that:
 1. Reads byte 0 of the RTP payload → `SFrameDescriptor{S, E, T}`
 2. Strips byte 0 from the payload (the rest is encrypted data)
-3. Returns `SframeRtpPacketReceived(packet, descriptor)`
+3. Returns `std::unique_ptr<SframeRtpPacketReceived>` (or `nullptr` on
+   an empty payload)
 
 It does not implement `VideoRtpDepacketizer` — the descriptor format is
 independent of the wrapped media, so the same class is reused for any
 encrypted RTP payload.
 
-**Location:** `modules/rtp_rtcp/source/rtp_depacketizer_sframe.{h,cc}`
+**Location:** `modules/rtp_rtcp/source/rtp_format_sframe.{h,cc}`
 
 ### `SFramePacketBuffer`
 
@@ -232,23 +230,30 @@ S→E runs per draft-ietf-avtcore-rtp-sframe section 5.2.
 
 #### Internal design
 
-**Storage.** Circular buffer indexed by `seq_num % buffer_size`, same
-pattern as the existing `PacketBuffer`.  Starts at 96 slots and doubles
-up to 2048.
+**Storage.** Fixed-size circular buffer of `unique_ptr<SframeRtpPacketReceived>`
+indexed by `seq_num % buffer_size` (default `2048`), same pattern as the
+existing `PacketBuffer`.
 
-**`InsertPacket` flow:**
+**`InsertPacket` flow** — returns
+`std::variant<AssembledFrame, InsertResult>`:
 
-1. `UpdateWindowStart(seq_num)` — reject packets older than the window.
+1. `UpdateWindowStart(seq_num)` — reject packets older than the window
+   (returns `InsertResult::kNoFrame`).
 2. `ResolveSlot(seq_num)` — find a buffer slot.  Returns one of:
-   - `kOk` — empty slot found (possibly after expansion).
-   - `kDuplicate` — packet already buffered; return an empty result.
-   - `kFull` — buffer at max capacity; `Clear()` and set `buffer_cleared`.
-3. Store packet in the slot.
-4. `FindFrame(seq_num)` — check if insertion completes a frame:
+   - `kOk` — empty slot found; store the packet there.
+   - `kDuplicate` — packet already buffered; return
+     `InsertResult::kNoFrame`.
+   - `kFull` — buffer at capacity; `Clear()` and return
+     `InsertResult::kBufferCleared` so the caller can request a
+     keyframe.
+3. `FindFrame(seq_num)` — check if insertion completes a frame:
    `FindFrameStart` walks backward looking for `S=1`, `FindFrameEnd`
    walks forward looking for `E=1`, and `AssembleFrame` validates the
-   run (see below) and moves packets out of the buffer into the result.
-   On validation failure the frame is dropped and the slots are cleared.
+   run (see below) and moves packets out of the buffer into an
+   `AssembledFrame{encryption_level, packets}`.  If no end is found yet,
+   return `InsertResult::kNoFrame`; on validation failure the frame is
+   dropped, the slots are cleared, and `InsertResult::kNoFrame` is
+   returned.
 
 #### Validation rules (in `AssembleFrame`)
 
@@ -276,3 +281,5 @@ Handles SFrame decryption for both modes:
   enter the codec depacketizer.
 - **T=0 (per-frame):** decrypts the reassembled bitstream at
   `OnAssembledFrame` after `PacketBuffer` assembly.
+
+**Location:** `modules/sframe/sframe_decrypter.{h,cc}`
