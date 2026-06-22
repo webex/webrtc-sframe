@@ -1,4 +1,4 @@
-# Video Receive Pipeline — SFrame Integration Plan
+# Video Receive Pipeline - SFrame Integration
 
 ## Table of Contents
 
@@ -11,13 +11,13 @@
   - [`SframeRtpPacketReceived`](#sframertppacketreceived)
   - [`RtpDepacketizerSframe`](#rtpdepacketizersframe)
   - [`SFramePacketBuffer`](#sframepacketbuffer)
-  - [`SframeDecrypter`](#sframedecrypter)
+  - [`SframeDecryptor`](#sframedecryptor)
 
 ## Overview
 
-This document describes the changes needed to add the SFrame receive
-pipeline to `RtpVideoStreamReceiver2`, handling both T=0 (per-frame) and
-T=1 (per-packet) modes.
+This document describes the SFrame receive pipeline implemented in
+`RtpVideoStreamReceiver2`, handling both T=0 (per-frame) and T=1
+(per-packet) modes.
 
 The core idea is a small intercept in front of the existing receive path:
 an SFrame-aware depacketizer parses the 1-byte payload descriptor, a
@@ -42,7 +42,7 @@ flowchart TD
     SPB -->|overflow| KF[RequestKeyFrame]
     SPB -->|complete run| TBit{T-bit?}
 
-    TBit -->|T=1 per-packet| Dec1[SframeDecrypter<br/>decrypt each packet]
+    TBit -->|T=1 per-packet| Dec1[SframeDecryptor<br/>decrypt each packet]
     Dec1 --> Plain
 
     TBit -->|T=0 per-frame| Raw[VideoRtpDepacketizerRaw<br/>tag sframe_encrypted=true]
@@ -53,7 +53,7 @@ flowchart TD
     PB --> OI[OnInsertedPacket<br/>assemble frame]
     OI --> OA[OnAssembledFrame]
 
-    OA -->|sframe_encrypted| Dec0[SframeDecrypter<br/>decrypt frame]
+    OA -->|sframe_encrypted| Dec0[SframeDecryptor<br/>decrypt frame]
     OA -->|cleartext| Down[reference finder → decode]
     Dec0 --> Down
 ```
@@ -68,7 +68,7 @@ flowchart TD
 | `SframeRtpPacketReceived` | `RtpPacketReceived` + parsed descriptor |
 | `SFramePacketBuffer` | Circular buffer, validates S→E runs |
 | `RtpDepacketizerSframe` | Depacketizer: parses + strips 1-byte descriptor from RTP payload |
-| SFrame decrypter | Actual SFrame decryption (per-packet for T=1, per-frame for T=0) |
+| SFrame decryptor | Actual SFrame decryption (per-packet for T=1, per-frame for T=0) |
 
 ---
 
@@ -183,7 +183,7 @@ struct RTPVideoHeader {
    `RTPVideoHeader`.
 5. **`OnAssembledFrame`** — check
    `frame->GetRtpVideoHeader().sframe_encrypted`: if `true`, decrypt
-   the frame via `sframe_decrypter_->DecryptFrame()`.  After decryption
+   the frame via the SFrame decryptor.  After decryption
    the cleartext frame continues through the remaining pipeline
    (`frame_transformer_delegate_` → `OnCompleteFrames`).
 
@@ -274,7 +274,7 @@ discards all packets up to and including `seq_num` and locks the window
 start at that point — late packets before the cleared point are
 rejected.
 
-### `SframeDecrypter`
+### `SframeDecryptor`
 
 Handles SFrame decryption for both modes:
 - **T=1 (per-packet):** decrypts individual packet payloads before they
@@ -282,4 +282,4 @@ Handles SFrame decryption for both modes:
 - **T=0 (per-frame):** decrypts the reassembled bitstream at
   `OnAssembledFrame` after `PacketBuffer` assembly.
 
-**Location:** `modules/sframe/sframe_decrypter.{h,cc}`
+**Location:** `modules/sframe` media decryptor adapter
