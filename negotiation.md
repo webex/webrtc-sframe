@@ -23,15 +23,15 @@ This means:
 
 | Layer | Description |
 |-------|-------------|
-| **Application API** | `RtpSenderInterface::CreateSframeEncrypterOrError()` / `RtpReceiverInterface::CreateSframeDecrypterOrError()` — enables SFrame on the sender/receiver, which internally notifies the transceiver via `SframeEnablementDelegate` |
-| **Transceiver State** | Each transceiver tracks an SFrame enabled state (not yet decided / enabled / disabled) — set to enabled when the observer callback fires, drives SDP generation |
+| **Application API** | `RtpSenderInterface::CreateSframeEncryptorOrError()` / `RtpReceiverInterface::CreateSframeDecryptorOrError()` - enables SFrame on the sender/receiver, which internally notifies the transceiver via the `enable_sframe_at_owner_` callback |
+| **Transceiver State** | Each transceiver tracks an SFrame enabled state (not yet decided / enabled / disabled) - set to enabled when the owner callback fires, drives SDP generation |
 | **Offer/Answer** | SFrame preference is carried per media section during offer/answer creation |
 | **SDP Wire Format** | `a=sframe` attribute line present in the m= section when SFrame is enabled |
 
 ## SFrame Negotiation Rules
 
-1. **Opt-in only**: SFrame is disabled by default. The application must call `CreateSframeEncrypterOrError()` on the sender and/or `CreateSframeDecrypterOrError()` on the receiver to enable it. These calls internally notify the transceiver via the `SframeEnablementDelegate` callback.
-2. **No downgrade**: Once SFrame has been enabled on a transceiver (via the observer callback), the SFrame enabled state is permanent. Calling `CreateSframeEncrypterOrError`/`CreateSframeDecrypterOrError` again returns `INVALID_MODIFICATION` if the transceiver has already completed negotiation without SFrame.
+1. **Opt-in only**: SFrame is disabled by default. The application must call `CreateSframeEncryptorOrError()` on the sender and/or `CreateSframeDecryptorOrError()` on the receiver to enable it. These calls internally notify the transceiver via the `enable_sframe_at_owner_` callback bound to `RtpTransceiver::TryToEnableSframe()`.
+2. **No downgrade**: Once SFrame has been enabled on a transceiver (via the owner callback), the SFrame enabled state is permanent. Calling `CreateSframeEncryptorOrError`/`CreateSframeDecryptorOrError` again returns `INVALID_MODIFICATION` if the transceiver has already completed negotiation without SFrame.
 3. **Offers are never rejected for `a=sframe`**: Per the standard O/A model, the answerer accepts the offer and answers honestly — omitting `a=sframe` if it doesn't support SFrame.
 4. **Answers cannot introduce `a=sframe`**: If the offer did not include `a=sframe` for a media section, the answer must not add it. This is an RFC 3264 constraint — the answer is bounded by the offer. The SDP factory ensures answers only include `a=sframe` when both the offer and local preferences agree, and malicious answers that violate this are rejected.
 5. **Answer SFrame is negotiated, not copied**: The answer's `a=sframe` is only set when both the offer contains `a=sframe` AND the answerer's local preference has SFrame enabled. A mismatch is not an error at the SDP factory level; it simply means the answer lacks `a=sframe`.
@@ -41,18 +41,18 @@ This means:
 
 ## Transceiver SFrame State
 
-Each transceiver tracks an SFrame enabled state, updated internally via the state observer callback (not directly by the application):
+Each transceiver tracks an SFrame enabled state, updated internally via the owner callback (not directly by the application):
 
 | State | Meaning |
 |-------|--------|
 | Not yet decided | SFrame has not been enabled on sender or receiver |
-| Enabled | SFrame is active (set when `CreateSframeEncrypterOrError` or `CreateSframeDecrypterOrError` is called on the sender/receiver, which triggers the observer) |
+| Enabled | SFrame is active (set when `CreateSframeEncryptorOrError` or `CreateSframeDecryptorOrError` is called on the sender/receiver, which triggers the observer) |
 
 The transceiver implements the state observer. When the callback fires:
 - If SFrame is not yet decided: marks it as enabled, returns OK, triggers negotiation-needed
 - If SFrame is already enabled: returns OK (idempotent — both sender and receiver may call it)
 
-Once the first negotiation completes without SFrame (because the application never called `CreateSframeEncrypterOrError`/`CreateSframeDecrypterOrError`), subsequent attempts to enable SFrame return `INVALID_MODIFICATION`.
+Once the first negotiation completes without SFrame (because the application never called `CreateSframeEncryptorOrError`/`CreateSframeDecryptorOrError`), subsequent attempts to enable SFrame return `INVALID_MODIFICATION`.
 
 ---
 
@@ -102,22 +102,22 @@ sequenceDiagram
     AppA->>PCA: AddTransceiver(audio)
     PCA-->>AppA: transceiver A (with sender A, receiver A)
 
-    AppA->>SA: CreateSframeEncrypterOrError(options)
+    AppA->>SA: CreateSframeEncryptorOrError(options)
     SA->>TA: TryToEnableSframe() via observer
     Note over TA: SFrame marked as enabled
     TA-->>SA: RTCError::OK()
-    SA-->>AppA: RTCErrorOr<SframeEncrypterInterface> (key handle)
+    SA-->>AppA: RTCErrorOr<SframeEncryptorInterface> (key handle)
 
     PCA-->>AppA: onnegotiationneeded
 
     AppB->>PCB: addTrack(audioTrack)
     PCB-->>AppB: transceiver B (matchable per JSEP §5.10)
 
-    AppB->>SB: CreateSframeEncrypterOrError(options)
+    AppB->>SB: CreateSframeEncryptorOrError(options)
     SB->>TB: TryToEnableSframe() via observer
     Note over TB: SFrame marked as enabled
     TB-->>SB: RTCError::OK()
-    SB-->>AppB: RTCErrorOr<SframeEncrypterInterface> (key handle)
+    SB-->>AppB: RTCErrorOr<SframeEncryptorInterface> (key handle)
 
     Note over AppA,AppB: Offer/Answer Exchange
 
@@ -164,7 +164,7 @@ sequenceDiagram
     AppA->>PCA: AddTransceiver(audio)
     PCA-->>AppA: transceiver A
 
-    AppA->>SA: CreateSframeEncrypterOrError(options)
+    AppA->>SA: CreateSframeEncryptorOrError(options)
     SA->>TA: TryToEnableSframe()
     Note over TA: SFrame marked as enabled
     TA-->>SA: RTCError::OK()
@@ -173,7 +173,7 @@ sequenceDiagram
 
     AppB->>PCB: addTrack(audioTrack)
     PCB-->>AppB: transceiver B (matchable per JSEP §5.10)
-    Note over AppB,TB: Application B does NOT call<br/>CreateSframeEncrypterOrError or CreateSframeDecrypterOrError
+    Note over AppB,TB: Application B does NOT call<br/>CreateSframeEncryptorOrError or CreateSframeDecryptorOrError
 
     AppA->>PCA: CreateOffer()
     PCA-->>AppA: SDP Offer with "a=sframe"
@@ -221,7 +221,7 @@ sequenceDiagram
 
     AppA->>PCA: AddTransceiver(audio)
     PCA-->>AppA: transceiver A
-    Note over AppA,TA: Offerer does NOT call CreateSframeEncrypterOrError()
+    Note over AppA,TA: Offerer does NOT call CreateSframeEncryptorOrError()
 
     AppA->>PCA: CreateOffer()
     PCA-->>AppA: SDP Offer WITHOUT "a=sframe"
@@ -270,7 +270,7 @@ sequenceDiagram
     AppA->>PCA: AddTransceiver(audio)
     PCA-->>AppA: transceiver A
 
-    AppA->>SA: CreateSframeEncrypterOrError(options)
+    AppA->>SA: CreateSframeEncryptorOrError(options)
     SA->>TA: TryToEnableSframe()
     Note over TA: SFrame marked as enabled
     TA-->>SA: RTCError::OK()
@@ -318,7 +318,7 @@ sequenceDiagram
 ### What is NOT done (by design)
 
 - **Offers are never rejected for `a=sframe`**: The answerer accepts the offer and answers honestly. The offerer handles mismatches.
-- **SFrame is not auto-enabled on existing transceivers**: When an existing transceiver does not have SFrame enabled, the remote offer's `a=sframe` does not auto-enable it. SFrame is an encryption feature requiring explicit opt-in via `CreateSframeEncrypterOrError`/`CreateSframeDecrypterOrError` and key management infrastructure.
+- **SFrame is not auto-enabled on existing transceivers**: When an existing transceiver does not have SFrame enabled, the remote offer's `a=sframe` does not auto-enable it. SFrame is an encryption feature requiring explicit opt-in via `CreateSframeEncryptorOrError`/`CreateSframeDecryptorOrError` and key management infrastructure.
 
 ---
 
@@ -326,7 +326,7 @@ sequenceDiagram
 
 ### Negotiation-Needed Triggered by SFrame Enablement
 
-When `CreateSframeEncrypterOrError` or `CreateSframeDecrypterOrError` is called, the sender/receiver notifies the transceiver via the state observer. This marks SFrame as enabled on the transceiver, which differs from what was last negotiated, triggering a new offer/answer round.
+When `CreateSframeEncryptorOrError` or `CreateSframeDecryptorOrError` is called, the sender/receiver notifies the transceiver via the state observer. This marks SFrame as enabled on the transceiver, which differs from what was last negotiated, triggering a new offer/answer round.
 
 ```mermaid
 sequenceDiagram
@@ -337,11 +337,11 @@ sequenceDiagram
 
     Note over App,T: Initial state: SFrame not enabled, media flowing
 
-    App->>S: CreateSframeEncrypterOrError(options)
+    App->>S: CreateSframeEncryptorOrError(options)
     S->>T: TryToEnableSframe()
     Note over T: SFrame marked as enabled
     T-->>S: RTCError::OK()
-    S-->>App: RTCErrorOr<SframeEncrypterInterface>
+    S-->>App: RTCErrorOr<SframeEncryptorInterface>
 
     PC-->>App: onnegotiationneeded
     Note over PC: Transceiver's SFrame state differs from<br/>what was last negotiated → needs renegotiation
@@ -356,7 +356,7 @@ sequenceDiagram
 
 ### SFrame Cannot Be Enabled After Negotiation Without It
 
-If a transceiver completes a negotiation round without SFrame enabled, `SetLocalDescription(answer)` locks the SFrame state. After that, calling `CreateSframeEncrypterOrError` or `CreateSframeDecrypterOrError` is rejected because the observer returns `INVALID_MODIFICATION`.
+If a transceiver completes a negotiation round without SFrame enabled, `SetLocalDescription(answer)` locks the SFrame state. After that, calling `CreateSframeEncryptorOrError` or `CreateSframeDecryptorOrError` is rejected because the observer returns `INVALID_MODIFICATION`.
 
 ```mermaid
 sequenceDiagram
@@ -367,7 +367,7 @@ sequenceDiagram
 
     App->>PC: AddTransceiver(audio)
     PC-->>App: transceiver (with sender, receiver)
-    Note over App,T: Application does NOT call<br/>CreateSframeEncrypterOrError or CreateSframeDecrypterOrError
+    Note over App,T: Application does NOT call<br/>CreateSframeEncryptorOrError or CreateSframeDecryptorOrError
 
     Note over App,PC: Offer/Answer exchange completes without a=sframe
 
@@ -379,12 +379,11 @@ sequenceDiagram
 
     Note over App,T: Later, application tries to enable SFrame...
 
-    App->>S: CreateSframeEncrypterOrError(options)
+    App->>S: CreateSframeEncryptorOrError(options)
     S->>T: TryToEnableSframe()
     T-->>S: ❌ INVALID_MODIFICATION
     S-->>App: RTCError(INVALID_MODIFICATION)
     Note over App: "Cannot enable SFrame after<br/>negotiation completed without it"
 ```
 
-> **Key point:** `CreateSframeEncrypterOrError`/`CreateSframeDecrypterOrError` must be called **before** the first negotiation completes. Once `SetLocalDescription(answer)` is called without SFrame, the transceiver's SFrame state is permanently locked.
-
+> **Key point:** `CreateSframeEncryptorOrError`/`CreateSframeDecryptorOrError` must be called **before** the first negotiation completes. Once `SetLocalDescription(answer)` is called without SFrame, the transceiver's SFrame state is permanently locked.
