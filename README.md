@@ -12,6 +12,7 @@ linked documents.
 |---|---|
 | [api-definitions.md](api-definitions.md) | Public SFrame API: modes, cipher suites, key-management handles, and the sender/receiver creation entry points |
 | [transceiver-enablement.md](transceiver-enablement.md) | How an application enables SFrame on a transceiver, the transceiver SFrame state, and the renegotiation it triggers |
+| [transceiver-stream-enablement.md](transceiver-stream-enablement.md) | How the channel-level SFrame requirement is propagated into per-stream enforcement |
 | [negotiation.md](negotiation.md) | Offer/answer behavior, the SFrame SDP attribute, downgrade handling, and answer validation |
 
 ## How It Works
