@@ -12,7 +12,10 @@ linked documents.
 |---|---|
 | [api-definitions.md](api-definitions.md) | Public SFrame API: modes, cipher suites, key-management handles, and the sender/receiver creation entry points |
 | [transceiver-enablement.md](transceiver-enablement.md) | How an application enables SFrame on a transceiver, the transceiver SFrame state, and the renegotiation it triggers |
-| [transceiver-stream-enablement.md](transceiver-stream-enablement.md) | How the channel-level SFrame requirement is propagated into per-stream enforcement |
+| [channel-to-stream-propagation.md](channel-to-stream-propagation.md) | Overview of how the section-level SFrame requirement is propagated into per-stream enforcement, and a comparison of three designs for it |
+| &nbsp;&nbsp;↳ [propagation-option-channel-latch.md](propagation-option-channel-latch.md) | Design option 1: base channel holds a single requirement latch and fans it out; full write-up and the four offer/answer flows |
+| &nbsp;&nbsp;↳ [propagation-option-per-channel-cache.md](propagation-option-per-channel-cache.md) | Design option 2: each media channel caches the requirement and fans it out; full write-up and the four offer/answer flows |
+| &nbsp;&nbsp;↳ [propagation-option-sframe-state.md](propagation-option-sframe-state.md) | Design option 3: a transceiver-owned, worker-confined state object both media channels observe and read through; full write-up and the four offer/answer flows |
 | [negotiation.md](negotiation.md) | Offer/answer behavior, the SFrame SDP attribute, downgrade handling, and answer validation |
 
 ## How It Works
