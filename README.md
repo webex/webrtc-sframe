@@ -13,6 +13,7 @@ linked documents.
 | [api-definitions.md](api-definitions.md) | Public SFrame API: modes, cipher suites, key-management handles, and the sender/receiver creation entry points |
 | [transceiver-enablement.md](transceiver-enablement.md) | How an application enables SFrame on a transceiver, the transceiver SFrame state, and the renegotiation it triggers |
 | [negotiation.md](negotiation.md) | Offer/answer behavior, the SFrame SDP attribute, downgrade handling, and answer validation |
+| [script-transform-type-options.md](script-transform-type-options.md) | Two options for telling the RTP stack that a frame transformer exchanges Sframe frames ("sframe" script transform): options passed with the transformer, or the transformer declaring itself through `GetSframeUsage()`; both with three states (unspecified, Sframe, no Sframe) |
 
 ## How It Works
 
